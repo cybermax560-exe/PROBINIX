@@ -2,6 +2,8 @@
 
 JTAGulator-inspired multi-tool for hardware hackers, built for RP2040 microcontroller based development boards.
 
+![](images/PROBINIX-Interface.png?raw=true "PROBINIX v1.0 Interface")
+
 ## Features
 - Detects JTAG & SWD debug pinout (JTAGulator function)  
 - Functions as a USB-to-Serial adapter  
