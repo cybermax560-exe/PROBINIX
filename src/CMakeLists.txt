@@ -112,6 +112,15 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 
+# Board selection: cmake -DPROBINIX_PIZERO=ON builds for the Waveshare RP2040-PiZero
+option(PROBINIX_PIZERO "Build for the Waveshare RP2040-PiZero" OFF)
+if(PROBINIX_PIZERO)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        PROBINIX_BOARD_PIZERO=1
+        PICO_FLASH_SIZE_BYTES=16777216
+    )
+endif()
+
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
 

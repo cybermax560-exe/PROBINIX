@@ -60,7 +60,22 @@ char *version="1.0";
 #define BOLD                 "\033[1m"
 
 
+#ifndef PROBINIX_BOARD_PIZERO
+#define PROBINIX_BOARD_PIZERO 0
+#endif
+
 #define onboardLED    25
+
+#if PROBINIX_BOARD_PIZERO
+// Waveshare RP2040-PiZero: no user LED, and GP25 drives the HDMI port.
+#define BOARD_NAME          "Waveshare RP2040-PiZero"
+#define statusLedInit()     ((void)0)
+#define statusLed(on)       ((void)(on))
+#else
+#define BOARD_NAME          "Raspberry Pi Pico family"
+#define statusLedInit()     do { gpio_init(onboardLED); gpio_set_dir(onboardLED, GPIO_OUT); } while (0)
+#define statusLed(on)       gpio_put(onboardLED, (on))
+#endif
 #define unusedGPIO    21                               // Pins on Pico are accessed using GPIO names
 #define MAX_NUM_JTAG  32
 #define maxChannels   16                               // Max number of channels supported by Pico  
@@ -68,7 +83,11 @@ char *version="1.0";
 // Hardware boot mode pins
 #define hwBootUSB2SerialPin  26
 #define hwBootOpenocdPin     27
+#if PROBINIX_BOARD_PIZERO
+#define hwBootCmsisdapPin    17                        // GP28 is not on the PiZero header
+#else
 #define hwBootCmsisdapPin    28
+#endif
 
 bool isChannelSafe[maxChannels];
 volatile int usbMode    = USB_MODE_DEFAULT;
@@ -90,6 +109,8 @@ uint xTDO;
 uint xTCK;
 uint xTMS;
 uint xTRST;
+
+static int knownTck = -1, knownTms = -1, knownTdi = -1, knownTdo = -1;
 
 // function declarations (Needs clean-up later)
 void resetUART(void);
@@ -134,6 +155,20 @@ static void uiCentered(const char *color, const char *text)
 #define UI_CHIP     "RP2350"
 #else
 #define UI_CHIP     "RP2040"
+#endif
+
+#if PROBINIX_BOARD_PIZERO
+#define UI_TITLE_CHIP   "RP2040-PiZero"
+#else
+#define UI_TITLE_CHIP   UI_CHIP
+#endif
+
+#if PROBINIX_BOARD_PIZERO
+// RP2040-PiZero 40-pin header position for GP0-GP27 (from the Waveshare schematic)
+static const uint8_t headerPinOfGpio[28] = {
+    27, 28,  3,  5,  8, 10, 31, 26, 24, 32, 23, 19, 21, 33,  7, 29,
+    36, 11, 12, 35, 38, 40, 15, 16, 18, 22, 37, 13
+};
 #endif
 
 static void uiSection(const char *title, const char *hint)
@@ -182,6 +217,13 @@ static void uiPinout(void)
     uiPinLine("SWD",  "GP2 = SWCLK  GP3 = SWDIO");
     uiPinLine("SPI",  "GP1 = CS     GP2 = CLK    GP3 = MOSI   GP4 = MISO");
     uiPinLine("I2C",  "GP0 = SDA    GP1 = SCL");
+#if PROBINIX_BOARD_PIZERO
+    printf("%s%s  " CLR_DIM "Header pin for each GPIO on the RP2040-PiZero:" OFF "%s", EOL, UI_INDENT, EOL);
+    printf("%s    GP0  = pin 27    GP1  = pin 28    GP2  = pin 3     GP3  = pin 5%s", UI_INDENT, EOL);
+    printf("%s    GP4  = pin 8     GP5  = pin 10    GP6  = pin 31    GP7  = pin 26%s", UI_INDENT, EOL);
+    printf("%s    GP8  = pin 24    GP9  = pin 32    GP10 = pin 23    GP11 = pin 19%s", UI_INDENT, EOL);
+    printf("%s    GP12 = pin 21    GP13 = pin 33    GP14 = pin 7     GP15 = pin 29%s", UI_INDENT, EOL);
+#endif
 }
 
 #define CLR_OK      "\033[1;32m"
@@ -203,7 +245,22 @@ static void uiWireHeader(void)
 
 static void uiWire(const char *probinixPin, const char *targetPin)
 {
-    printf("%s  " CLR_KEY "%-12s" OFF CLR_DIM "->  " OFF "%s%s", UI_INDENT, probinixPin, targetPin, EOL);
+    printf("%s  " CLR_KEY "%-12s" OFF CLR_DIM "->  " OFF "%s", UI_INDENT, probinixPin, targetPin);
+#if PROBINIX_BOARD_PIZERO
+    if (probinixPin[0] == 'G' && probinixPin[1] == 'P' && probinixPin[2] >= '0' && probinixPin[2] <= '9')
+    {
+        int gpio = probinixPin[2] - '0';
+        if (probinixPin[3] >= '0' && probinixPin[3] <= '9')
+        {
+            gpio = gpio * 10 + (probinixPin[3] - '0');
+        }
+        if (gpio < 28)
+        {
+            printf(CLR_DIM "   (header pin %d)" OFF, headerPinOfGpio[gpio]);
+        }
+    }
+#endif
+    printf("%s", EOL);
 }
 
 static void uiNote(const char *message)
@@ -243,7 +300,7 @@ static void uiTitleBar(void)
 
     uiBoardId(id, sizeof(id));
     snprintf(left, sizeof(left), " PROBINIX v%s", version);
-    snprintf(right, sizeof(right), "%s  %lu MHz  ID %s ", UI_CHIP, uiClockMhz(), id);
+    snprintf(right, sizeof(right), "%s  %lu MHz  ID %s ", UI_TITLE_CHIP, uiClockMhz(), id);
 
     int gap = UI_WIDTH - (int)strlen(left) - (int)strlen(right);
     if (gap < 1)
@@ -269,6 +326,7 @@ static void uiSystemInfo(void)
     uiInfoRow("Author", "BugFox");
     snprintf(value, sizeof(value), "%s at %lu MHz", UI_CHIP, uiClockMhz());
     uiInfoRow("Processor", value);
+    uiInfoRow("Board", BOARD_NAME);
     uiBoardId(id, sizeof(id));
     uiInfoRow("Board ID", id);
     uiInfoRow("Build", __DATE__ " " __TIME__);
@@ -304,11 +362,13 @@ void showMenu(void)
     printf("%s", EOL);
     uiGroup("Debug interface discovery");
     uiCommands('j', "Scan for JTAG pinout", 's', "Scan for SWD pinout");
+    uiCommands('d', "Fast JTAG IDCODE scan", 'r', "Find JTAG RTCK pin");
     uiCommands('p', pulse, 0, NULL);
     printf("%s", EOL);
     uiGroup("Target reconnaissance");
     uiCommands('m', "Monitor pin activity", 'u', "Find UART TX, RX and baud");
     uiCommands('i', "Scan I2C bus", 'f', "Identify SPI flash chip");
+    uiCommands('e', "I2C EEPROM dump", 'g', "Manual pin control");
     printf("%s", EOL);
     uiGroup("Hardware modes (unplug or reset to exit)");
     uiCommands('U', "USB-to-serial bridge", 'F', "Flashrom SPI programmer");
@@ -317,13 +377,23 @@ void showMenu(void)
     uiPinout();
 
     uiSection("BOOT MODES", "Connect one pin to GND, then reset");
+#if PROBINIX_BOARD_PIZERO
+    printf("%s  " CLR_KEY "GP26 (pin 37)" OFF "  USB-to-serial%s", UI_INDENT, EOL);
+    printf("%s  " CLR_KEY "GP27 (pin 13)" OFF "  OpenOCD%s", UI_INDENT, EOL);
+    printf("%s  " CLR_KEY "GP17 (pin 11)" OFF "  CMSIS-DAP%s", UI_INDENT, EOL);
+#else
     printf("%s  " CLR_KEY "GPIO 26" OFF "  USB-to-serial     "
            CLR_KEY "GPIO 27" OFF "  OpenOCD     "
            CLR_KEY "GPIO 28" OFF "  CMSIS-DAP%s", UI_INDENT, EOL);
+#endif
 
     uiSection("NOTES", NULL);
     printf("%s  - Disable local echo in your terminal.%s", UI_INDENT, EOL);
     printf("%s  - If no JTAG or SWD pinout is found, toggle pin pulsing (p) and retry.%s", UI_INDENT, EOL);
+#if PROBINIX_BOARD_PIZERO
+    printf("%s  - GP2, GP3 and GP6 have onboard pull-ups, so they read High when unused.%s", UI_INDENT, EOL);
+    printf("%s  - Use the USB-C port labeled USB. The PIO-USB port shares GP6 and GP7.%s", UI_INDENT, EOL);
+#endif
     printf("%s  " CLR_WARN "! 3.3 V logic only. Keep GPIO 0-15 disconnected from GND while scanning." OFF "%s%s",
            UI_INDENT, EOL, EOL);
 }
@@ -603,6 +673,10 @@ void displayPinout(void)
     printProgress(maxPermutations, maxPermutations);
     printf("%s%s", EOL, EOL);
     uiOk("JTAG pinout found");
+    knownTck = xTCK;
+    knownTms = xTMS;
+    knownTdi = xTDI;
+    knownTdo = xTDO;
     printf("%s  TDI = " CLR_KEY "GP%u" OFF "   TDO = " CLR_KEY "GP%u" OFF "   TCK = " CLR_KEY "GP%u" OFF
            "   TMS = " CLR_KEY "GP%u" OFF "   TRST = ", UI_INDENT, xTDI, xTDO, xTCK, xTMS);
     if(xTRST != 0)
@@ -859,7 +933,7 @@ void jtagScan(void)
                             continue;
                         }
                         // onBoard LED notification
-                        gpio_put(onboardLED, 0);
+                        statusLed(0);
                         
                         progressCount = progressCount+1;
                         printProgress(progressCount, maxPermutations);
@@ -931,13 +1005,13 @@ void jtagScan(void)
                               displayPinout();
                               displayDeviceDetails();
                               // onBoard LED notification
-                              gpio_put(onboardLED, 1);
+                              statusLed(1);
                               return;
                             }                            
                         }
                         // onBoard LED notification
                         jtagResetChannels(channelCount);
-                        gpio_put(onboardLED, 1);
+                        statusLed(1);
                     }
             }
         }
@@ -952,6 +1026,468 @@ void jtagScan(void)
 
 }
 
+
+//------------------------------- Fast IDCODE scan, RTCK detection, pin control ---------------------
+
+// Read a decimal number. Enter alone selects defaultValue when it is >= 0.
+static int uiReadNumber(int minValue, int maxValue, int defaultValue)
+{
+    static bool lastWasCR = false;
+
+    while (true)
+    {
+        char digits[4];
+        int length = 0;
+
+        while (true)
+        {
+            int c = getc(stdin);
+            if (c == '\n' && lastWasCR)
+            {
+                lastWasCR = false;      // Second half of a CRLF line ending
+                continue;
+            }
+            lastWasCR = (c == '\r');
+            if (c == '\r' || c == '\n')
+            {
+                break;
+            }
+            if ((c == '\b' || c == 127) && length > 0)
+            {
+                length--;
+                printf("\b \b");
+            }
+            else if (c >= '0' && c <= '9' && length < 3)
+            {
+                digits[length++] = (char)c;
+                putchar(c);
+            }
+            fflush(stdout);
+        }
+        printf("%s", EOL);
+
+        if (length == 0 && defaultValue >= 0)
+        {
+            return defaultValue;
+        }
+        if (length > 0)
+        {
+            int value = 0;
+            for (int i = 0; i < length; i++)
+            {
+                value = value * 10 + (digits[i] - '0');
+            }
+            if (value >= minValue && value <= maxValue)
+            {
+                return value;
+            }
+        }
+        printf("%s  Enter a value from %d to %d: ", UI_INDENT, minValue, maxValue);
+        fflush(stdout);
+    }
+}
+
+static int uiAskPin(const char *name, int defaultPin)
+{
+    if (defaultPin >= 0)
+    {
+        printf("%s" CLR_KEY "?" OFF " %s GPIO (0-%d) [%d]: ", UI_INDENT, name, maxChannels - 1, defaultPin);
+    }
+    else
+    {
+        printf("%s" CLR_KEY "?" OFF " %s GPIO (0-%d): ", UI_INDENT, name, maxChannels - 1);
+    }
+    fflush(stdout);
+    return uiReadNumber(0, maxChannels - 1, defaultPin);
+}
+
+// After a TAP reset most chips load IDCODE into the data register, so it can be read
+// with only TCK, TMS and TDO. Bits arrive least significant first.
+static uint32_t jtagReadIdcode(void)
+{
+    uint32_t value = 0;
+    restoreIdle();
+    enterShiftDR();
+    for (int bit = 0; bit < 32; bit++)
+    {
+        if (tdoRead())
+        {
+            value |= (1u << bit);
+        }
+    }
+    restoreIdle();
+    return value;
+}
+
+static void jtagDrivePins(uint tck, uint tms)
+{
+    gpio_put(tck, 0);
+    gpio_put(tms, 1);
+    gpio_set_dir(tck, GPIO_OUT);
+    gpio_set_dir(tms, GPIO_OUT);
+}
+
+#define IDCODE_MAX_RESULTS 8
+
+void jtagIdcodeScan(void)
+{
+    uint8_t resultTck[IDCODE_MAX_RESULTS], resultTms[IDCODE_MAX_RESULTS], resultTdo[IDCODE_MAX_RESULTS];
+    uint32_t resultId[IDCODE_MAX_RESULTS];
+    int found = 0;
+
+    uiSection("FAST JTAG IDCODE SCAN", "finds TCK, TMS and TDO, then TDI");
+    printf("%s" CLR_KEY "?" OFF " Channels connected, starting at GP0 (3-%d): ", UI_INDENT, maxChannels);
+    fflush(stdout);
+    int channels = uiReadNumber(3, maxChannels, -1);
+
+    uint32_t total = (uint32_t)channels * (channels - 1) * (channels - 2);
+    uint32_t done = 0;
+    int lastPercent = -1;
+    char line[64];
+    snprintf(line, sizeof(line), "Testing %lu combinations...", (unsigned long)total);
+    uiInfo(line);
+
+    statusLed(0);
+    for (int tck = 0; tck < channels; tck++)
+    {
+        for (int tms = 0; tms < channels; tms++)
+        {
+            if (tms == tck)
+            {
+                continue;
+            }
+            for (int tdo = 0; tdo < channels; tdo++)
+            {
+                if (tdo == tck || tdo == tms)
+                {
+                    continue;
+                }
+                done++;
+                int percent = (int)((done * 100) / total);
+                if (percent != lastPercent)
+                {
+                    printProgress(done, total);
+                    lastPercent = percent;
+                }
+
+                jtagInitChannels(channels);
+                if (jPulsePins)
+                {
+                    pulsePins(channels);
+                }
+                jTCK = tck;
+                jTMS = tms;
+                jTDO = tdo;
+                jTDI = tdo;                     // TDI is not driven in this scan
+                jtagDrivePins(tck, tms);
+
+                uint32_t id = jtagReadIdcode();
+                if ((id & 1) && id != 0xFFFFFFFFu && isValidDeviceID(id) && jtagReadIdcode() == id)
+                {
+                    if (found < IDCODE_MAX_RESULTS)
+                    {
+                        resultTck[found] = tck;
+                        resultTms[found] = tms;
+                        resultTdo[found] = tdo;
+                        resultId[found] = id;
+                    }
+                    found++;
+                }
+                jtagResetChannels(channels);
+            }
+        }
+    }
+    statusLed(1);
+    printProgress(total, total);
+    printf("%s%s", EOL, EOL);
+
+    if (found == 0)
+    {
+        uiFail("No JTAG IDCODE found. Check wiring and GND, or toggle pin pulsing (p).");
+        uiNote("Some chips have no IDCODE. The full scan (j) can still find them.");
+        printf("%s", EOL);
+        return;
+    }
+
+    for (int i = 0; i < found && i < IDCODE_MAX_RESULTS; i++)
+    {
+        uiOk("TCK, TMS and TDO found");
+        printf("%s  TCK = " CLR_KEY "GP%d" OFF "   TMS = " CLR_KEY "GP%d" OFF "   TDO = " CLR_KEY "GP%d" OFF "%s",
+               UI_INDENT, resultTck[i], resultTms[i], resultTdo[i], EOL);
+        uiPrintDevice(0, resultId[i]);
+        printf("%s", EOL);
+    }
+
+    // Find TDI with a BYPASS test on the remaining channels, using the first result.
+    int tck = resultTck[0], tms = resultTms[0], tdo = resultTdo[0], tdi = -1;
+    knownTck = tck;
+    knownTms = tms;
+    knownTdo = tdo;
+    uiInfo("Searching the other channels for TDI...");
+    for (int pin = 0; pin < channels && tdi < 0; pin++)
+    {
+        if (pin == tck || pin == tms || pin == tdo)
+        {
+            continue;
+        }
+        jtagInitChannels(channels);
+        jTDI = pin;
+        jTDO = tdo;
+        jTCK = tck;
+        jTMS = tms;
+        jtagConfig(pin, tdo, tck, tms);
+        int devices = detectDevices();
+        uint32_t pattern = uint32Rand();
+        if (devices > 0 && bypassTest(devices, pattern) == pattern)
+        {
+            tdi = pin;
+            jDeviceCount = devices;
+        }
+        jtagResetChannels(channels);
+    }
+
+    if (tdi < 0)
+    {
+        uiFail("TDI not found. Check that TDI is connected to one of the scanned channels.");
+        printf("%s", EOL);
+        return;
+    }
+
+    knownTdi = tdi;
+    xTDI = tdi;
+    xTDO = tdo;
+    xTCK = tck;
+    xTMS = tms;
+    xTRST = 0;
+    printf("%s" CLR_OK "[+]" OFF " TDI = " CLR_KEY "GP%d" OFF " (confirmed with a BYPASS test, %d device%s in the chain)%s%s",
+           UI_INDENT, tdi, jDeviceCount, jDeviceCount == 1 ? "" : "s", EOL, EOL);
+
+    jTDI = tdi;
+    jTDO = tdo;
+    jTCK = tck;
+    jTMS = tms;
+    if (uiAskYes("Start OpenOCD JTAG mode with this pinout?"))
+    {
+        uiNote("Example command. Replace COM4 with your PROBINIX port.");
+        uiCommand("JTAG", "openocd -f interface/buspirate.cfg -c \"buspirate port COM4; transport select jtag;\" -f target/esp32.cfg");
+        printf("%s", EOL);
+        resetUART();
+        initOpenocdMode(jTCK, jTMS, jTDI, jTDO, OPENOCD_PIN_DEFAULT, OPENOCD_PIN_DEFAULT, OPENOCD_MODE_JTAG);
+    }
+}
+
+// RTCK echoes TCK back from the target. Toggle TCK with TMS high (TAP held in reset)
+// and look for a channel that follows every edge.
+#define RTCK_EDGES      64
+#define RTCK_WAIT_US    500
+
+void jtagRtckScan(void)
+{
+    uiSection("JTAG RTCK DETECTION", "needs TCK and TMS");
+    printf("%s" CLR_KEY "?" OFF " Channels connected, starting at GP0 (3-%d) [%d]: ", UI_INDENT, maxChannels, maxChannels);
+    fflush(stdout);
+    int channels = uiReadNumber(3, maxChannels, maxChannels);
+    int tck = uiAskPin("TCK", knownTck);
+    int tms = uiAskPin("TMS", knownTms);
+    if (tck == tms)
+    {
+        uiFail("TCK and TMS must be different pins.");
+        printf("%s", EOL);
+        return;
+    }
+
+    uint32_t candidates = 0;
+    for (int pin = 0; pin < channels; pin++)
+    {
+        if (pin != tck && pin != tms && pin != knownTdi && pin != knownTdo)
+        {
+            candidates |= 1u << pin;
+            gpio_set_dir(pin, GPIO_IN);
+            gpio_set_pulls(pin, false, true);
+        }
+    }
+    jtagDrivePins(tck, tms);
+    sleep_ms(1);
+
+    uint8_t matches[maxChannels] = {0};
+    for (int edge = 0; edge < RTCK_EDGES; edge++)
+    {
+        bool level = (edge & 1) == 0;
+        gpio_put(tck, level);
+        busy_wait_us_32(RTCK_WAIT_US);
+        uint32_t inputs = gpio_get_all();
+        for (int pin = 0; pin < channels; pin++)
+        {
+            if ((candidates & (1u << pin)) && (((inputs >> pin) & 1u) == level))
+            {
+                matches[pin]++;
+            }
+        }
+    }
+    gpio_put(tck, 0);
+
+    int found = 0;
+    for (int pin = 0; pin < channels; pin++)
+    {
+        if ((candidates & (1u << pin)) && matches[pin] == RTCK_EDGES)
+        {
+            printf("%s" CLR_OK "[+]" OFF " GP%d follows TCK. It looks like RTCK.%s", UI_INDENT, pin, EOL);
+            found++;
+        }
+    }
+    if (found == 0)
+    {
+        uiFail("No RTCK pin found. Most targets don't have one, so this is normal.");
+    }
+
+    for (int pin = 0; pin < channels; pin++)
+    {
+        gpio_set_dir(pin, GPIO_IN);
+        gpio_disable_pulls(pin);
+    }
+    printf("%s", EOL);
+}
+
+// Manual pin control: read every channel, drive one high or low, release it, or pulse it.
+static uint8_t pinControlMode[maxChannels];        // 0 = input, 1 = high, 2 = low
+
+static void pinControlLevels(void)
+{
+    uint32_t levels = gpio_get_all();
+    printf("%s  Level", UI_INDENT);
+    for (int pin = 0; pin < maxChannels; pin++)
+    {
+        printf(((levels >> pin) & 1u) ? CLR_OK "%4s" OFF : CLR_DIM "%4s" OFF, ((levels >> pin) & 1u) ? "1" : "0");
+    }
+}
+
+static void pinControlShow(void)
+{
+    printf("%s  " CLR_DIM "GPIO " OFF, UI_INDENT);
+    for (int pin = 0; pin < maxChannels; pin++)
+    {
+        printf(CLR_DIM "%4d" OFF, pin);
+    }
+    printf("%s", EOL);
+#if PROBINIX_BOARD_PIZERO
+    printf("%s  " CLR_DIM "Pin  " OFF, UI_INDENT);
+    for (int pin = 0; pin < maxChannels; pin++)
+    {
+        printf(CLR_DIM "%4d" OFF, headerPinOfGpio[pin]);
+    }
+    printf("%s", EOL);
+#endif
+    printf("%s  Mode ", UI_INDENT);
+    for (int pin = 0; pin < maxChannels; pin++)
+    {
+        const char *mode = pinControlMode[pin] == 1 ? CLR_KEY "  HI" OFF : pinControlMode[pin] == 2 ? CLR_KEY "  LO" OFF : "  in";
+        printf("%s", mode);
+    }
+    printf("%s", EOL);
+    pinControlLevels();
+    printf("%s%s", EOL, EOL);
+}
+
+static void pinControlSet(int pin, int mode)
+{
+    if (mode == 0)
+    {
+        gpio_set_dir(pin, GPIO_IN);
+        gpio_set_pulls(pin, false, true);
+    }
+    else
+    {
+        gpio_put(pin, mode == 1);
+        gpio_set_dir(pin, GPIO_OUT);
+    }
+    pinControlMode[pin] = (uint8_t)mode;
+}
+
+void pinControl(void)
+{
+    uiSection("MANUAL PIN CONTROL", "GP0-GP15");
+    uiNote("Inputs use a weak pull-down. Drive only pins that are inputs on the target, such as");
+    uiNote("reset or boot pins. Driving a pin that the target also drives can damage both boards.");
+    printf("%s", EOL);
+
+    for (int pin = 0; pin < maxChannels; pin++)
+    {
+        pinControlSet(pin, 0);
+    }
+
+    while (true)
+    {
+        pinControlShow();
+        printf("%s  " CLR_KEY "r" OFF "  Read again      " CLR_KEY "h" OFF "  Drive high      " CLR_KEY "l" OFF "  Drive low       "
+               CLR_KEY "i" OFF "  Release%s", UI_INDENT, EOL);
+        printf("%s  " CLR_KEY "p" OFF "  Pulse low       " CLR_KEY "w" OFF "  Watch live      " CLR_KEY "q" OFF "  Back to the main menu%s%s",
+               UI_INDENT, EOL, EOL);
+        printf("%s" CLR_HEAD "pins" OFF "> ", UI_INDENT);
+        fflush(stdout);
+
+        int key = getc(stdin);
+        while (key == CR || key == LF)
+        {
+            key = getc(stdin);
+        }
+        printf("%c%s%s", (key >= 32 && key < 127) ? key : ' ', EOL, EOL);
+
+        if (key == 'q')
+        {
+            break;
+        }
+        if (key == 'h' || key == 'l' || key == 'i' || key == 'p')
+        {
+            int pin = uiAskPin("Which", -1);
+            if (key == 'h')
+            {
+                pinControlSet(pin, 1);
+            }
+            else if (key == 'l')
+            {
+                pinControlSet(pin, 2);
+            }
+            else if (key == 'i')
+            {
+                pinControlSet(pin, 0);
+            }
+            else
+            {
+                pinControlSet(pin, 2);
+                sleep_ms(100);
+                pinControlSet(pin, 0);
+                printf("%s" CLR_OK "[+]" OFF " GP%d pulsed low for 100 ms.%s", UI_INDENT, pin, EOL);
+            }
+            printf("%s", EOL);
+        }
+        else if (key == 'w')
+        {
+            uiNote("Watching levels. Press any key to stop.");
+            while (getchar_timeout_us(0) == PICO_ERROR_TIMEOUT)
+            {
+                printf("\r");
+                pinControlLevels();
+                fflush(stdout);
+                sleep_ms(50);
+            }
+            printf("%s%s", EOL, EOL);
+        }
+        else if (key != 'r')
+        {
+            uiFail("Unknown key. Use r, h, l, i, p, w or q.");
+            printf("%s", EOL);
+        }
+    }
+
+    for (int pin = 0; pin < maxChannels; pin++)
+    {
+        gpio_set_dir(pin, GPIO_IN);
+        gpio_disable_pulls(pin);
+        pinControlMode[pin] = 0;
+    }
+    uiOk("All pins released.");
+    printf("%s", EOL);
+}
 
 //-------------------------------------SWD Scan [custom implementation]-----------------------------
      
@@ -1210,9 +1746,9 @@ void swdTrySWDJ(void)
 bool swdBruteForce(void)
 {
     // onBoard LED notification
-    gpio_put(onboardLED, 0);
+    statusLed(0);
     swdTrySWDJ();
-    gpio_put(onboardLED, 1);
+    statusLed(1);
     if(swdDeviceFound)
     { 
         swdToJTAG();
@@ -1355,9 +1891,8 @@ void hardwareModeBoot(void)
 
 int main()
 {
-    gpio_init(onboardLED);
-    gpio_set_dir(onboardLED, GPIO_OUT);
-    gpio_put(onboardLED, 1);
+    statusLedInit();
+    statusLed(1);
     initChannels();
 
     jPulsePins=false;
@@ -1398,6 +1933,18 @@ int main()
                 swdScan();
                 break;
 
+            case 'd':
+                jtagIdcodeScan();
+                break;
+
+            case 'r':
+                jtagRtckScan();
+                break;
+
+            case 'g':
+                pinControl();
+                break;
+
             case 'p':
                 jPulsePins=!jPulsePins;
                 if(jPulsePins)
@@ -1416,9 +1963,9 @@ int main()
             case 'l':
                 for(int x=0;x<=25;x++)
                 {
-                    gpio_put(onboardLED, 1);
+                    statusLed(1);
                     sleep_ms(250);
-                    gpio_put(onboardLED, 0);
+                    statusLed(0);
                     sleep_ms(250);
                 }
                 break;
@@ -1437,6 +1984,10 @@ int main()
 
             case 'f':
                 reconSpiFlashId();
+                break;
+
+            case 'e':
+                reconEeprom();
                 break;
 
             case 'U':

@@ -73,10 +73,31 @@ static void reconTitle(const char *title)
 //------------------------------------------ Input -------------------------------------------------
 
 // Read a decimal number. Enter alone selects defaultValue when it is >= 0.
-static int readNumber(int minValue, int maxValue, int defaultValue)
+// Read one key. The LF of a CRLF line ending is skipped so Enter counts once.
+static int readKey(void)
 {
     static bool lastWasCR = false;
+    int c = getc(stdin);
+    if (c == '\n' && lastWasCR)
+    {
+        c = getc(stdin);
+    }
+    lastWasCR = (c == '\r');
+    return c;
+}
 
+static bool readYes(const char *question)
+{
+    printf("     \033[1;33m?\033[0m %s (y/n): ", question);
+    fflush(stdout);
+    int answer = readKey();
+    printf("%c%s", (answer >= 32 && answer < 127) ? answer : ' ', EOL);
+    return answer == 'y' || answer == 'Y';
+}
+
+// Read a decimal number. Enter alone selects defaultValue when it is >= 0.
+static int readNumber(int minValue, int maxValue, int defaultValue)
+{
     while (true)
     {
         char digits[4];
@@ -84,13 +105,7 @@ static int readNumber(int minValue, int maxValue, int defaultValue)
 
         while (true)
         {
-            int c = getc(stdin);
-            if (c == '\n' && lastWasCR)
-            {
-                lastWasCR = false;      // Second half of a CRLF line ending
-                continue;
-            }
-            lastWasCR = (c == '\r');
+            int c = readKey();
             if (c == '\r' || c == '\n')
             {
                 break;
@@ -459,7 +474,7 @@ void reconUartScan(void)
 
     printf("%s     Press any key, then power-cycle or reset the target so it prints boot output.%s", EOL, EOL);
     fflush(stdout);
-    getc(stdin);
+    readKey();
 
     listenOnChannels(count);
     printf("%s     Step 1: listening for TX for %d seconds...%s%s", EOL, UART_SCAN_MS / 1000, EOL, EOL);
@@ -514,7 +529,7 @@ void reconUartScan(void)
     printf("     " CLR_DIM "Wait until the target has finished booting before you continue." OFF "%s%s", EOL, EOL);
     printf("     \033[1;33m?\033[0m Search for the target's RX pin? (y/n): ");
     fflush(stdout);
-    int answer = getc(stdin);
+    int answer = readKey();
     printf("%c%s%s", (answer >= 32 && answer < 127) ? answer : ' ', EOL, EOL);
 
     int rxFound = 0;
@@ -778,7 +793,7 @@ void reconSpiFlashId(void)
            SPI_CS, SPI_CLK, SPI_MOSI, SPI_MISO, EOL);
     printf("     Press any key to read the chip ID...%s%s", EOL, EOL);
     fflush(stdout);
-    getc(stdin);
+    readKey();
 
     gpio_init(SPI_CS);
     gpio_init(SPI_CLK);
@@ -850,4 +865,364 @@ void reconSpiFlashId(void)
         printf("     Capacity     : Unknown code 0x%02X%s", capacity, EOL);
     }
     printf("%s", EOL);
+}
+
+//------------------------------------------ I2C EEPROM tools --------------------------------------
+// Dumps are kept in RAM only. Nothing is ever written to PROBINIX's own flash.
+
+#define CLR_KEY         "\033[1;33m"
+#define CLR_FAIL        "\033[1;31m"
+
+#define EE_DATA_MAX     65536u
+#define EE_PAGE_LINES   16
+
+typedef struct
+{
+    const char *name;
+    uint32_t size;
+    uint8_t addressBytes;
+} eepromChip;
+
+static const eepromChip eepromChips[] = {
+    {"24C01",    128, 1}, {"24C02",   256, 1}, {"24C04",   512, 1}, {"24C08",  1024, 1},
+    {"24C16",   2048, 1}, {"24C32",  4096, 2}, {"24C64",  8192, 2}, {"24C128", 16384, 2},
+    {"24C256", 32768, 2}, {"24C512", 65536, 2},
+};
+#define EE_CHIP_COUNT ((int)(sizeof(eepromChips) / sizeof(eepromChips[0])))
+
+static uint8_t eepromBuffer[EE_DATA_MAX];
+static uint32_t eepromSize;                 // 0 until a chip has been read
+static uint8_t eepromChipIndex;
+static uint8_t eepromAddress;
+
+static uint32_t crc32Of(const uint8_t *data, uint32_t length)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++)
+        {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+// ---- I2C byte transfers (built on the scanner's bit-banged bus)
+
+static bool i2cStart(void)
+{
+    lineRelease(i2cSda);
+    i2cDelay();
+    if (!i2cClockHigh())
+    {
+        return false;
+    }
+    lineLow(i2cSda);
+    i2cDelay();
+    lineLow(i2cScl);
+    i2cDelay();
+    return true;
+}
+
+static bool i2cWriteByte(uint8_t value)
+{
+    bool nack = true;
+    for (int bit = 7; bit >= 0; bit--)
+    {
+        if (!i2cClockBit((value >> bit) & 1, NULL))
+        {
+            return false;
+        }
+    }
+    if (!i2cClockBit(true, &nack))
+    {
+        return false;
+    }
+    return !nack;
+}
+
+static bool i2cReadByte(bool acknowledge, uint8_t *value)
+{
+    uint8_t result = 0;
+    for (int bit = 0; bit < 8; bit++)
+    {
+        bool level = false;
+        if (!i2cClockBit(true, &level))
+        {
+            return false;
+        }
+        result = (uint8_t)((result << 1) | (level ? 1 : 0));
+    }
+    if (!i2cClockBit(!acknowledge, NULL))
+    {
+        return false;
+    }
+    *value = result;
+    return true;
+}
+
+// Sequential reads in 256-byte blocks. Small chips put the block number in the device address.
+static bool eepromRead(const eepromChip *chip, uint8_t address)
+{
+    for (uint32_t offset = 0; offset < chip->size; offset += 256)
+    {
+        uint32_t count = chip->size - offset;
+        if (count > 256)
+        {
+            count = 256;
+        }
+        uint8_t device = address;
+        if (chip->addressBytes == 1)
+        {
+            device |= (uint8_t)(offset >> 8);
+        }
+
+        bool ok = i2cStart() && i2cWriteByte((uint8_t)(device << 1));
+        if (ok && chip->addressBytes == 2)
+        {
+            ok = i2cWriteByte((uint8_t)(offset >> 8));
+        }
+        ok = ok && i2cWriteByte((uint8_t)(offset & 0xFF));
+        ok = ok && i2cStart() && i2cWriteByte((uint8_t)((device << 1) | 1));
+        for (uint32_t i = 0; ok && i < count; i++)
+        {
+            ok = i2cReadByte(i + 1 < count, &eepromBuffer[offset + i]);
+        }
+        i2cStop();
+        if (!ok)
+        {
+            return false;
+        }
+
+        printf("\r     Reading... %lu of %lu bytes", (unsigned long)(offset + count), (unsigned long)chip->size);
+        fflush(stdout);
+    }
+    printf("\r%60s\r", "");
+    return true;
+}
+
+// ---- Display and transfer to the computer
+
+static void eepromHexDump(const uint8_t *data, uint32_t size)
+{
+    printf("     " CLR_DIM "Offset  00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F  ASCII" OFF "%s", EOL);
+    for (uint32_t line = 0; line < size; line += 16)
+    {
+        printf("     %04lX    ", (unsigned long)line);
+        for (uint32_t i = 0; i < 16; i++)
+        {
+            if (line + i < size)
+            {
+                printf("%02X ", data[line + i]);
+            }
+            else
+            {
+                printf("   ");
+            }
+        }
+        putchar(' ');
+        for (uint32_t i = 0; i < 16 && line + i < size; i++)
+        {
+            uint8_t c = data[line + i];
+            putchar((c >= 32 && c < 127) ? c : '.');
+        }
+        printf("%s", EOL);
+
+        uint32_t shown = line + 16;
+        if (shown < size && (shown / 16) % EE_PAGE_LINES == 0)
+        {
+            printf("     " CLR_DIM "-- %lu of %lu bytes shown. Press Enter for more, or q to stop --" OFF,
+                   (unsigned long)shown, (unsigned long)size);
+            fflush(stdout);
+            int key = readKey();
+            printf("\r%78s\r", "");
+            if (key == 'q' || key == 'Q')
+            {
+                break;
+            }
+        }
+    }
+    printf("%s", EOL);
+}
+
+static void eepromExportHex(const uint8_t *data, uint32_t size)
+{
+    for (uint32_t address = 0; address < size; address += 16)
+    {
+        uint32_t count = (size - address > 16) ? 16 : size - address;
+        uint8_t sum = (uint8_t)(count + (address >> 8) + (address & 0xFF));
+        printf(":%02lX%04lX00", (unsigned long)count, (unsigned long)address);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            printf("%02X", data[address + i]);
+            sum = (uint8_t)(sum + data[address + i]);
+        }
+        printf("%02X%s", (uint8_t)(0x100 - sum), EOL);
+    }
+    printf(":00000001FF%s", EOL);
+}
+
+static void eepromSendCommand(void)
+{
+    if (eepromSize == 0)
+    {
+        printf("     " CLR_FAIL "[-]" OFF " Nothing to send yet. Read an EEPROM first (r).%s%s", EOL, EOL);
+        return;
+    }
+    printf("     Turn on logging in your terminal so the dump is saved to a file on your computer.%s", EOL);
+    printf("     " CLR_DIM "PuTTY: Session > Logging > All session output     picocom: start with --logfile eeprom.log" OFF "%s", EOL);
+    printf("     Press any key to send the dump as Intel HEX...%s", EOL);
+    fflush(stdout);
+    readKey();
+    printf("%s", EOL);
+
+    eepromExportHex(eepromBuffer, eepromSize);
+
+    printf("%s     " CLR_OK "[+]" OFF " Sent %lu bytes from %s at 0x%02X, CRC32 0x%08lX. Stop logging now.%s",
+           EOL, (unsigned long)eepromSize, eepromChips[eepromChipIndex].name, eepromAddress,
+           (unsigned long)crc32Of(eepromBuffer, eepromSize), EOL);
+    printf("     Convert the log to a binary file on your computer:%s", EOL);
+    printf("       Linux:    grep '^:' eeprom.log > eeprom.hex && objcopy -I ihex -O binary eeprom.hex eeprom.bin%s", EOL);
+    printf("       Windows:  open the log in a hex editor such as HxD with File > Import > Intel HEX%s%s", EOL, EOL);
+}
+
+// ---- Commands
+
+static void eepromReadCommand(void)
+{
+    printf("     Chip type:%s", EOL);
+    for (int i = 0; i < EE_CHIP_COUNT; i += 2)
+    {
+        printf("       " CLR_KEY "%2d" OFF "  %-7s %6lu bytes        " CLR_KEY "%2d" OFF "  %-7s %6lu bytes%s",
+               i + 1, eepromChips[i].name, (unsigned long)eepromChips[i].size,
+               i + 2, eepromChips[i + 1].name, (unsigned long)eepromChips[i + 1].size, EOL);
+    }
+    printf("%s     Select chip (1-%d): ", EOL, EE_CHIP_COUNT);
+    fflush(stdout);
+    int index = readNumber(1, EE_CHIP_COUNT, -1) - 1;
+    const eepromChip *chip = &eepromChips[index];
+
+    printf("     SDA GPIO (0-%d) [0]: ", CHANNELS - 1);
+    fflush(stdout);
+    i2cSda = readNumber(0, CHANNELS - 1, 0);
+    printf("     SCL GPIO (0-%d) [1]: ", CHANNELS - 1);
+    fflush(stdout);
+    i2cScl = readNumber(0, CHANNELS - 1, 1);
+    if (i2cSda == i2cScl)
+    {
+        printf("%s     " CLR_FAIL "[-]" OFF " SDA and SCL must be different pins.%s%s", EOL, EOL, EOL);
+        return;
+    }
+
+    uint32_t blocks = (chip->addressBytes == 1 && chip->size > 256) ? chip->size / 256 : 1;
+    uint8_t addressMask = (uint8_t)(0x07 & ~(blocks - 1));
+    if (addressMask)
+    {
+        printf("     Address pins A2-A0 as a number (0-7) [0]: ");
+        fflush(stdout);
+    }
+    uint8_t pins = addressMask ? (uint8_t)readNumber(0, 7, 0) : 0;
+    uint8_t address = (uint8_t)(0x50 | (pins & addressMask));
+
+    gpio_init(i2cSda);
+    gpio_init(i2cScl);
+    gpio_set_pulls(i2cSda, true, false);
+    gpio_set_pulls(i2cScl, true, false);
+    sleep_us(100);
+
+    bool ok = false;
+    uint64_t started = time_us_64();
+    printf("%s", EOL);
+    if (!i2cBusReady())
+    {
+        printf("     " CLR_FAIL "[-]" OFF " Bus is not idle: SDA or SCL is held low. Check the wiring.%s%s", EOL, EOL);
+    }
+    else if (!(ok = eepromRead(chip, address)))
+    {
+        printf("\r     " CLR_FAIL "[-]" OFF " No reply from an EEPROM at 0x%02X. Check wiring, chip type and address pins.%s%s",
+               address, EOL, EOL);
+    }
+    releasePin(i2cSda);
+    releasePin(i2cScl);
+    if (!ok)
+    {
+        eepromSize = 0;
+        return;
+    }
+
+    eepromSize = chip->size;
+    eepromChipIndex = (uint8_t)index;
+    eepromAddress = address;
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < eepromSize; i++)
+    {
+        used += (eepromBuffer[i] != 0xFF);
+    }
+
+    printf("     " CLR_OK "[+]" OFF " Read %lu bytes from %s at 0x%02X in %lu ms%s", (unsigned long)eepromSize,
+           chip->name, address, (unsigned long)((time_us_64() - started) / 1000), EOL);
+    printf("         CRC32 0x%08lX   %lu bytes hold data%s%s", (unsigned long)crc32Of(eepromBuffer, eepromSize),
+           (unsigned long)used, used ? "" : "   (the chip looks empty)", EOL);
+    printf("         " CLR_DIM "A chip smaller than the type you chose repeats its data." OFF "%s%s", EOL, EOL);
+
+    eepromHexDump(eepromBuffer, eepromSize);
+
+    if (readYes("Send this dump to your computer now?"))
+    {
+        printf("%s", EOL);
+        eepromSendCommand();
+    }
+    else
+    {
+        printf("%s     " CLR_DIM "The dump stays in memory until you read another chip or unplug PROBINIX. Press x to send it later." OFF "%s%s",
+               EOL, EOL, EOL);
+    }
+}
+
+static void eepromViewCommand(void)
+{
+    if (eepromSize == 0)
+    {
+        printf("     " CLR_FAIL "[-]" OFF " Nothing to view yet. Read an EEPROM first (r).%s%s", EOL, EOL);
+        return;
+    }
+    printf("     %s at 0x%02X, %lu bytes%s%s", eepromChips[eepromChipIndex].name, eepromAddress,
+           (unsigned long)eepromSize, EOL, EOL);
+    eepromHexDump(eepromBuffer, eepromSize);
+}
+
+void reconEeprom(void)
+{
+    reconTitle("I2C EEPROM DUMP");
+    printf("     Reads 24C01 to 24C512 EEPROMs and sends the dump to your computer. Wiring: SDA and SCL%s", EOL);
+    printf("     to any GPIO (default GP0 and GP1), GND to GND, and the chip powered at 3.3 V.%s", EOL);
+    printf("     " CLR_DIM "Dumps are never saved on PROBINIX. They stay in memory only until you unplug it." OFF "%s", EOL);
+
+    while (true)
+    {
+        printf("%s     " CLR_KEY "r" OFF "  Read an EEPROM            " CLR_KEY "v" OFF "  View the last dump%s", EOL, EOL);
+        printf("     " CLR_KEY "x" OFF "  Send it to your computer  " CLR_KEY "q" OFF "  Back to the main menu%s%s", EOL, EOL);
+        printf("  " CLR_HEAD "eeprom" OFF "> ");
+        fflush(stdout);
+
+        int key = readKey();
+        while (key == '\r' || key == '\n')
+        {
+            key = readKey();
+        }
+        printf("%c%s%s", (key >= 32 && key < 127) ? key : ' ', EOL, EOL);
+
+        switch (key)
+        {
+            case 'r': eepromReadCommand(); break;
+            case 'v': eepromViewCommand(); break;
+            case 'x': eepromSendCommand(); break;
+            case 'q': return;
+            default:
+                printf("     " CLR_FAIL "[-]" OFF " Unknown key. Use r, v, x or q.%s", EOL);
+                break;
+        }
+    }
 }

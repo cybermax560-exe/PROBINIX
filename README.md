@@ -6,7 +6,7 @@
 
 ![Version](https://img.shields.io/badge/version-1.0-blue)
 ![Platform](https://img.shields.io/badge/platform-RP2040-red)
-![Boards](https://img.shields.io/badge/boards-Pico%20%7C%20Pico%20W-brightgreen)
+![Boards](https://img.shields.io/badge/boards-Pico%20%7C%20Pico%20W%20%7C%20PiZero-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 [Supported Boards](#supported-boards) •
@@ -32,8 +32,9 @@ PROBINIX turns an inexpensive Raspberry Pi Pico or Pico W into a complete hardwa
 | Discover | Investigate | Connect |
 |---|---|---|
 | Find JTAG and SWD debug pinouts | Monitor pin activity | USB-to-serial bridge |
-| Find UART TX, RX and baud rate | Scan I2C buses | Flashrom SPI programmer |
-| Identify chips by IDCODE | Identify SPI flash chips | OpenOCD and CMSIS-DAP debugger |
+| Find UART TX, RX and baud rate | Identify SPI flash chips | Flashrom SPI programmer |
+| Identify chips by IDCODE | Dump I2C EEPROMs | OpenOCD JTAG and SWD adapter |
+| Scan I2C buses | Send dumps to your computer | CMSIS-DAP debugger |
 
 ## Table of Contents
 
@@ -44,6 +45,7 @@ PROBINIX turns an inexpensive Raspberry Pi Pico or Pico W into a complete hardwa
 - [Tool Guide](#tool-guide)
 - [Wiring Reference](#wiring-reference)
 - [Hardware Boot Modes](#hardware-boot-modes)
+- [Waveshare RP2040-PiZero](#waveshare-rp2040-pizero)
 - [Troubleshooting](#troubleshooting)
 - [Safety Notes](#safety-notes)
 - [Building from Source](#building-from-source)
@@ -53,7 +55,7 @@ PROBINIX turns an inexpensive Raspberry Pi Pico or Pico W into a complete hardwa
 
 ## Supported Boards
 
-PROBINIX runs on boards built around the **RP2040** microcontroller. One firmware file works on all of the boards below.
+PROBINIX runs on boards built around the **RP2040** microcontroller. One firmware file works on all of the boards below, except the Waveshare RP2040-PiZero, which has its own firmware file.
 
 | Board | Status | Notes |
 |---|---|---|
@@ -62,6 +64,7 @@ PROBINIX runs on boards built around the **RP2040** microcontroller. One firmwar
 | **Raspberry Pi Pico W** | ✅ Supported | Wi-Fi and Bluetooth are not used. The onboard LED is not used as a status light. |
 | **Raspberry Pi Pico WH** | ✅ Supported | Same as Pico W, with pre-soldered headers |
 | **Waveshare RP2040-Zero** | ✅ Supported | Compact board. See the [pinout image](#wiring-reference). |
+| **Waveshare RP2040-PiZero** | ✅ Supported | Uses its own firmware file. See [Waveshare RP2040-PiZero](#waveshare-rp2040-pizero). |
 | Other RP2040 boards | ⚠️ Should work | The board must expose GP0 to GP15. GP26 to GP28 are needed only for boot modes. |
 | RP2350 boards, such as Pico 2 | 🧪 Experimental | No firmware file in v1.0 |
 
@@ -72,7 +75,9 @@ PROBINIX runs on boards built around the **RP2040** microcontroller. One firmwar
 
 ### 1. Flash the firmware
 
-1. Download `PROBINIX-v1.0-RP2040.uf2` from the [`firmware`](firmware) folder or the [Releases](../../releases) page.
+1. Download the firmware for your board from the [`firmware`](firmware) folder or the [Releases](../../releases) page.
+   - Raspberry Pi Pico, Pico W and other RP2040 boards: `PROBINIX-v1.0-RP2040.uf2`
+   - Waveshare RP2040-PiZero: `PROBINIX-v1.0-RP2040-PiZero.uf2`
 2. Hold the **BOOTSEL** button and connect the board to your computer with a USB cable.
 3. Release the button when a drive named `RPI-RP2` appears.
 4. Copy the `.uf2` file onto that drive. The board restarts as PROBINIX.
@@ -124,11 +129,15 @@ Commands are single keys and are **case-sensitive**. For example, `u` runs the U
 | `v` | System info | Shows firmware version, author, processor, clock, board ID, build date and pin pulsing setting |
 | `j` | JTAG scan | Finds TDI, TDO, TCK, TMS and TRST, then identifies the chips |
 | `s` | SWD scan | Finds SWCLK and SWDIO, then identifies the chip |
+| `d` | Fast IDCODE scan | Quickly finds TCK, TMS and TDO by reading the chip's ID, then finds TDI |
+| `r` | RTCK detection | Finds the optional JTAG return-clock pin |
 | `p` | Pin pulsing | Changes how idle channels are pulled during JTAG and SWD scans |
 | `m` | Pin monitor | Shows each channel's state, edges, frequency and duty cycle |
 | `u` | UART finder | Finds the target's TX pin and baud rate, then optionally its RX pin |
 | `i` | I2C scanner | Lists the addresses of devices on an I2C bus |
 | `f` | SPI flash ID | Reads the manufacturer and size of an SPI flash chip |
+| `e` | I2C EEPROM dump | Reads 24Cxx EEPROMs and sends the dump to your computer |
+| `g` | Manual pin control | Reads every channel, and drives, releases or pulses one channel by hand |
 | `U` | USB-to-serial | Turns PROBINIX into a USB serial adapter |
 | `F` | Flashrom | Turns PROBINIX into a Flashrom SPI programmer |
 | `O` | OpenOCD | Turns PROBINIX into a JTAG and SWD adapter for OpenOCD |
@@ -175,6 +184,42 @@ Finds an Arm SWD debug port.
 ```
 
 PROBINIX then offers to start OpenOCD SWD mode using the pins it found.
+
+#### `d` Fast IDCODE scan
+
+A faster way to find a JTAG port, based on JTAGulator's IDCODE scan. Most chips load their ID into the JTAG data register at reset, so PROBINIX can read it using only TCK, TMS and TDO. This skips TDI and tests far fewer combinations than the full scan.
+
+1. Connect GND and the suspected JTAG test points to GP0 and up.
+2. Press `d` and enter how many channels you connected, from 3 to 16.
+3. PROBINIX reports every TCK, TMS and TDO combination that returns a valid ID, with the chip's manufacturer.
+4. It then tests the remaining channels as TDI with a BYPASS test and reports the full pinout.
+
+```text
+  [+] TCK, TMS and TDO found
+    TCK = GP0   TMS = GP1   TDO = GP3
+    Device 0   IDCODE 0x4BA00477   ARM Ltd, part 0xBA00, rev 4
+
+  [+] TDI = GP2 (confirmed with a BYPASS test, 1 device in the chain)
+```
+
+With all four pins found, PROBINIX offers to start OpenOCD JTAG mode.
+
+| Channels | Full scan (`j`) combinations | Fast scan (`d`) combinations |
+|---|---|---|
+| 6 | 840 | 120 |
+| 8 | 3,024 | 336 |
+| 16 | 57,120 | 3,360 |
+
+> [!TIP]
+> Start with `d`. If it finds nothing, the chip may not support IDCODE, so use the full scan (`j`).
+
+#### `r` RTCK detection
+
+Some Arm chips have an extra JTAG pin called RTCK, which returns the clock to the debugger so it can match the chip's speed. Most targets don't have one.
+
+1. Press `r` and enter how many channels to check.
+2. Enter the TCK and TMS pins. If you've just run `j` or `d`, press Enter to use the pins it found.
+3. PROBINIX holds TMS high so the chip stays in reset, toggles TCK 64 times, and reports any channel that follows every change.
 
 #### `p` Pin pulsing
 
@@ -253,6 +298,79 @@ Identifies an SPI flash chip using the same wiring as Flashrom mode.
 ```
 
 Use it to confirm your wiring before reading or writing the chip with Flashrom.
+
+#### `e` I2C EEPROM dump
+
+Reads 24Cxx serial EEPROMs, such as the configuration and calibration chips found on many boards, and sends the dump to your computer.
+
+> [!NOTE]
+> Dumps are **never saved on PROBINIX**. A dump stays in PROBINIX's memory only until you read another chip or unplug it. The tool only reads the EEPROM and never writes to it.
+
+```text
+     r  Read an EEPROM            v  View the last dump
+     x  Send it to your computer  q  Back to the main menu
+```
+
+**Reading a chip**
+
+1. Connect the EEPROM's **SDA** and **SCL** to any GPIO (GP0 and GP1 by default), **GND** to GND, and power the chip at **3.3 V**.
+2. Press `e`, then `r`.
+3. Choose the chip type, the SDA and SCL pins, and the value of the chip's A2-A0 address pins. Most boards tie these to GND, which is `0`.
+4. PROBINIX reads the whole chip, then shows its size, CRC32 checksum and a hex dump, 256 bytes per page. Press Enter for the next page or `q` to stop.
+5. Press `y` to send the dump to your computer, or press `x` later.
+
+| Chip | Size | | Chip | Size |
+|---|---|---|---|---|
+| 24C01 | 128 bytes | | 24C32 | 4 KB |
+| 24C02 | 256 bytes | | 24C64 | 8 KB |
+| 24C04 | 512 bytes | | 24C128 | 16 KB |
+| 24C08 | 1 KB | | 24C256 | 32 KB |
+| 24C16 | 2 KB | | 24C512 | 64 KB |
+
+> [!TIP]
+> If you're not sure of the size, choose a larger type. A smaller chip repeats its data, so the point where the data starts repeating shows its real size.
+
+**Saving the dump on your computer**
+
+PROBINIX sends the dump as Intel HEX text through the serial console. Your terminal saves it to a file.
+
+1. Turn on logging in your terminal. In PuTTY, use **Session > Logging > All session output**. In picocom, start it with `--logfile eeprom.log`.
+2. Press `y` after reading, or `x` from the EEPROM menu, then press any key.
+3. Stop logging when PROBINIX reports that the dump was sent, and compare the CRC32 shown with your file if needed.
+4. Convert the log to a binary file:
+
+**Linux**
+
+```sh
+grep '^:' eeprom.log > eeprom.hex
+objcopy -I ihex -O binary eeprom.hex eeprom.bin
+```
+
+**Windows:** open the log in a hex editor such as [HxD](https://mh-nexus.de/en/hxd/) with **File > Import > Intel HEX**, then save it as a `.bin` file.
+
+#### `g` Manual pin control
+
+Reads and controls GP0 to GP15 by hand, like JTAGulator's GPIO mode. Use it to check wiring, find which test point a pin connects to, or hold a target's reset or boot pin.
+
+```text
+    GPIO    0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+    Mode   in  in  HI  in  in  in  in  in  in  in  in  in  in  in  in  in
+    Level   0   1   1   0   0   0   0   0   0   0   0   0   0   0   0   0
+```
+
+| Key | Action |
+|---|---|
+| `r` | Read all pins again |
+| `h` / `l` | Drive a pin high or low |
+| `i` | Release a pin back to an input |
+| `p` | Pulse a pin low for 100 ms, such as a reset line |
+| `w` | Watch all levels live until you press a key |
+| `q` | Release every pin and return to the main menu |
+
+On the RP2040-PiZero, the table also shows each GPIO's header pin. All pins are released when you leave.
+
+> [!WARNING]
+> Drive only pins that are inputs on the target, such as reset or boot pins. Driving a pin that the target is also driving can damage both boards.
 
 ### Hardware modes
 
@@ -414,6 +532,57 @@ PROBINIX can start directly in a hardware mode, without the menu. This is useful
 
 Connect one pin to GND, then reset or reconnect the board. Only one boot mode can be active at a time. Disconnect the pin to return to the menu.
 
+## Waveshare RP2040-PiZero
+
+The [Waveshare RP2040-PiZero](https://www.waveshare.com/wiki/RP2040-PiZero) has a Raspberry Pi style 40-pin header, 16 MB of flash, a micro SD slot, an HDMI port and a second PIO-USB port. It uses its own firmware file, `PROBINIX-v1.0-RP2040-PiZero.uf2`.
+
+### Flashing
+
+1. Connect the USB-C port labeled **USB**. The port labeled **PIO-USB** does not work for flashing or the console.
+2. Hold **BOOT**, press and release **RUN**, then release **BOOT**. A drive named `RPI-RP2` appears.
+3. Copy `PROBINIX-v1.0-RP2040-PiZero.uf2` onto the drive.
+
+### Header pins
+
+PROBINIX uses the same GPIO numbers on every board, but on the PiZero they sit at different header positions. The console shows the header pin next to each GPIO in the menu and in every wiring list.
+
+| GPIO | Header pin | PROBINIX use | Onboard connection |
+|---|:---:|---|---|
+| GP0 | 27 | UART TX, JTAG TCK, I2C SDA | |
+| GP1 | 28 | UART RX, JTAG TMS, SPI CS, I2C SCL | |
+| GP2 | 3 | JTAG TDI, SWD SWCLK, SPI CLK | HDMI control line with 2.2 kΩ pull-up |
+| GP3 | 5 | JTAG TDO, SWD SWDIO, SPI MOSI | HDMI control line with 2.2 kΩ pull-up |
+| GP4 | 8 | SPI MISO | |
+| GP5 | 10 | Scan channel | |
+| GP6 | 31 | Scan channel | PIO-USB D+ with 2.2 kΩ pull-up |
+| GP7 | 26 | Scan channel | PIO-USB D- |
+| GP8 | 24 | Scan channel | |
+| GP9 | 32 | Scan channel | |
+| GP10 | 23 | Scan channel | |
+| GP11 | 19 | Scan channel | |
+| GP12 | 21 | Scan channel | |
+| GP13 | 33 | Scan channel | |
+| GP14 | 7 | Scan channel | |
+| GP15 | 29 | Scan channel | |
+
+Power pins: **3V3** on pins 1 and 17, **5V** on pins 2 and 4, and **GND** on pins 6, 9, 14, 20, 25, 30, 34 and 39.
+
+### Boot modes
+
+GP28 is not on the PiZero header, so the CMSIS-DAP boot pin moves to GP17.
+
+| Connect to GND | Header pin | Mode at startup |
+|---|:---:|---|
+| GP26 | 37 | USB-to-serial |
+| GP27 | 13 | OpenOCD JTAG/SWD |
+| GP17 | 11 | CMSIS-DAP v1.0 |
+
+### Differences from the Pico
+
+- **No status light:** the PiZero has only a power LED, so PROBINIX does not use an activity LED.
+- **Onboard pull-ups:** GP2, GP3 and GP6 have 2.2 kΩ pull-up resistors, so the pin monitor shows them as `High` when nothing is connected. JTAG, SWD and other tools work normally.
+- **Shared pins:** GP18 to GP21 connect to the micro SD slot and GP16 and GP22 to GP29 connect to the HDMI port. Leave the SD slot empty and HDMI unplugged while using PROBINIX.
+
 ## Troubleshooting
 
 ### General
@@ -437,6 +606,7 @@ Connect one pin to GND, then reset or reconnect the board. Only one boot mode ca
 | Unsure whether PROBINIX or the target is the problem | Connect GP0 to GP1 with nothing else attached, start `U`, and type. If you see your typing, the PROBINIX bridge works. |
 | UART finder finds no RX | The target may ignore input or have its console disabled. Wait until it has finished booting. |
 | Flashrom reads fail | Check wiring with `f` first, use shorter wires, and try `spispeed=1M`. For chips still on a board, hold the board's main processor in reset. |
+| EEPROM tool says no reply | Check SDA, SCL and GND, the chip type, and the A2-A0 address value. Run `i` to see which address the chip answers on. |
 
 ## Safety Notes
 
@@ -445,7 +615,7 @@ Connect one pin to GND, then reset or reconnect the board. Only one boot mode ca
 > - Always connect **GND** between PROBINIX and the target first.
 > - Keep GP0 to GP15 **away from GND** while scanning.
 > - Power the target from **3V3 OUT** only if it has no other power source.
-> - JTAG scans, SWD scans, the UART RX search, I2C scans and SPI tools drive pins. Connect only to the test points you intend to test.
+> - JTAG scans, SWD scans, RTCK detection, the UART RX search, I2C scans, SPI tools and manual pin control drive pins. Connect only to the test points you intend to test.
 
 > [!IMPORTANT]
 > Use PROBINIX only on hardware you own or are authorized to test.
@@ -474,6 +644,13 @@ cmake --build build
 
 The firmware is written to `build/PROBINIX.uf2`. The same file runs on the Pico and Pico W.
 
+To build for the Waveshare RP2040-PiZero, add the `PROBINIX_PIZERO` option:
+
+```sh
+cmake -S src -B build-pizero -DPICO_BOARD=pico -DPROBINIX_PIZERO=ON
+cmake --build build-pizero
+```
+
 ## Project Structure
 
 ```text
@@ -484,7 +661,7 @@ PROBINIX/
 │   ├── PROBINIX.c       Console, menu, JTAG and SWD scanning
 │   ├── usbDescriptors.c USB device descriptors
 │   └── modules/
-│       ├── recon/           Pin monitor, UART finder, I2C scanner and SPI flash ID
+│       ├── recon/           Pin monitor, UART finder, I2C scanner, SPI flash ID and EEPROM dump
 │       ├── usb2serial/      USB-to-serial bridge
 │       ├── flashProgrammer/ Flashrom serprog support
 │       ├── openocd/         OpenOCD Bus Pirate support
