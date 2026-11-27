@@ -32,6 +32,8 @@
 */
 
 #include "PROBINIX.h"
+#include <string.h>
+#include "pico/unique_id.h"
 
 const char *banner=R"banner(
                       ___  ___  ____  ___  _____  _______  __
@@ -99,95 +101,252 @@ static const char * const jep106[][126] = {
 
 long int strtol(const char *str, char **endptr, int base);
 
+// ------------------------------------------ Console UI ------------------------------------------
+
+#define UI_WIDTH    76
+#define UI_INDENT   "  "
+#define CLR_HEAD    "\033[1;36m"
+#define CLR_KEY     "\033[1;33m"
+#define CLR_DIM     "\033[90m"
+#define CLR_WARN    "\033[1;33m"
+
+static void uiRule(char ch)
+{
+    printf("%s" CLR_DIM, UI_INDENT);
+    for (int i = 0; i < UI_WIDTH; i++)
+    {
+        putchar(ch);
+    }
+    printf(OFF "%s", EOL);
+}
+
+static void uiCentered(const char *color, const char *text)
+{
+    int pad = (UI_WIDTH - (int)strlen(text)) / 2;
+    if (pad < 0)
+    {
+        pad = 0;
+    }
+    printf("%s%*s%s%s" OFF "%s", UI_INDENT, pad, "", color, text, EOL);
+}
+
+#if defined(PICO_RP2350) && PICO_RP2350
+#define UI_CHIP     "RP2350"
+#else
+#define UI_CHIP     "RP2040"
+#endif
+
+static void uiSection(const char *title, const char *hint)
+{
+    int used = (int)strlen(title) + 1;
+
+    printf("%s%s" CLR_HEAD "%s" OFF, EOL, UI_INDENT, title);
+    if (hint)
+    {
+        printf(" " CLR_DIM "(%s)" OFF, hint);
+        used += (int)strlen(hint) + 3;
+    }
+    printf(" " CLR_DIM);
+    for (int i = used; i < UI_WIDTH; i++)
+    {
+        putchar('-');
+    }
+    printf(OFF "%s", EOL);
+}
+
+static void uiGroup(const char *name)
+{
+    printf("%s" BOLD "%s" OFF "%s", UI_INDENT, name, EOL);
+}
+
+static void uiCommands(char key1, const char *text1, char key2, const char *text2)
+{
+    printf("%s  " CLR_KEY "%c" OFF "  %-34s", UI_INDENT, key1, text1);
+    if (key2)
+    {
+        printf(CLR_KEY "%c" OFF "  %s", key2, text2);
+    }
+    printf("%s", EOL);
+}
+
+static void uiPinLine(const char *name, const char *pins)
+{
+    printf("%s  " "\033[1;32m" "%-6s" OFF "%s%s", UI_INDENT, name, pins, EOL);
+}
+
+static void uiPinout(void)
+{
+    uiSection("PINOUT", NULL);
+    uiPinLine("UART", "GP0 = TX     GP1 = RX");
+    uiPinLine("JTAG", "GP0 = TCK    GP1 = TMS    GP2 = TDI    GP3 = TDO");
+    uiPinLine("SWD",  "GP2 = SWCLK  GP3 = SWDIO");
+    uiPinLine("SPI",  "GP1 = CS     GP2 = CLK    GP3 = MOSI   GP4 = MISO");
+    uiPinLine("I2C",  "GP0 = SDA    GP1 = SCL");
+}
+
+#define CLR_OK      "\033[1;32m"
+#define CLR_FAIL    "\033[1;31m"
+
+static void uiStatus(const char *color, const char *tag, const char *message)
+{
+    printf("%s%s%s" OFF " %s%s", UI_INDENT, color, tag, message, EOL);
+}
+
+#define uiOk(message)    uiStatus(CLR_OK, "[+]", message)
+#define uiFail(message)  uiStatus(CLR_FAIL, "[-]", message)
+#define uiInfo(message)  uiStatus(CLR_HEAD, "[*]", message)
+
+static void uiWireHeader(void)
+{
+    printf("%s  " CLR_DIM "%-12s    %s" OFF "%s", UI_INDENT, "PROBINIX", "TARGET", EOL);
+}
+
+static void uiWire(const char *probinixPin, const char *targetPin)
+{
+    printf("%s  " CLR_KEY "%-12s" OFF CLR_DIM "->  " OFF "%s%s", UI_INDENT, probinixPin, targetPin, EOL);
+}
+
+static void uiNote(const char *message)
+{
+    printf("%s  " CLR_DIM "%s" OFF "%s", UI_INDENT, message, EOL);
+}
+
+static void uiCommand(const char *label, const char *command)
+{
+    printf("%s  " BOLD "%-7s" OFF " %s%s", UI_INDENT, label, command, EOL);
+}
+
+static bool uiAskYes(const char *question)
+{
+    printf("%s" CLR_KEY "?" OFF " %s (y/n): ", UI_INDENT, question);
+    fflush(stdout);
+    cmd = getc(stdin);
+    printf("%c%s%s", (cmd >= 32 && cmd < 127) ? cmd : ' ', EOL, EOL);
+    return cmd == 'y' || cmd == 'Y';
+}
+
+static void uiBoardId(char *id, size_t length)
+{
+    pico_get_unique_board_id_string(id, length);
+}
+
+static unsigned long uiClockMhz(void)
+{
+    return (unsigned long)(clock_get_hz(clk_sys) / 1000000);
+}
+
+static void uiTitleBar(void)
+{
+    char left[32];
+    char right[64];
+    char id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
+
+    uiBoardId(id, sizeof(id));
+    snprintf(left, sizeof(left), " PROBINIX v%s", version);
+    snprintf(right, sizeof(right), "%s  %lu MHz  ID %s ", UI_CHIP, uiClockMhz(), id);
+
+    int gap = UI_WIDTH - (int)strlen(left) - (int)strlen(right);
+    if (gap < 1)
+    {
+        gap = 1;
+    }
+    printf("%s" "\033[30;46m" "%s%*s%s" OFF "%s", UI_INDENT, left, gap, "", right, EOL);
+}
+
+static void uiInfoRow(const char *label, const char *value)
+{
+    printf("%s  " CLR_DIM "%-13s" OFF "%s%s", UI_INDENT, label, value, EOL);
+}
+
+static void uiSystemInfo(void)
+{
+    char value[48];
+    char id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
+
+    uiSection("SYSTEM INFO", NULL);
+    snprintf(value, sizeof(value), "PROBINIX %s", version);
+    uiInfoRow("Firmware", value);
+    uiInfoRow("Author", "BugFox");
+    snprintf(value, sizeof(value), "%s at %lu MHz", UI_CHIP, uiClockMhz());
+    uiInfoRow("Processor", value);
+    uiBoardId(id, sizeof(id));
+    uiInfoRow("Board ID", id);
+    uiInfoRow("Build", __DATE__ " " __TIME__);
+    uiInfoRow("Pin pulsing", jPulsePins ? "ON" : "OFF");
+    printf("%s", EOL);
+}
+
 void splashScreen(void)
 {
-    printf("%s%s",EOL, banner);
+    printf("\033[2J\033[H");
+    uiTitleBar();
+    printf("\033[1;32m%s" OFF "%s%s", banner, EOL, EOL);
+    uiCentered(BOLD, "Hardware hacking multi-tool for RP2040 boards");
+    uiCentered(CLR_DIM, "by BugFox");
     printf("%s", EOL);
-    printf("%s          [  Hardware hacker's multi-tool based on RP2040 dev boards  ]", EOL);
-    printf("%s          +-----------------------------------------------------------+", EOL);
-    printf("%s          |                   PROBINIX by CybermaX                    |", EOL);
-    printf("%s          +-----------------------------------------------------------+%s%s", EOL, EOL, EOL);                                                                                                                                     
+    uiRule('=');
 }
 
 void showPrompt(void)
 {
-    printf(" > ");
+    printf("%s" CLR_HEAD "probinix" OFF "> ", UI_INDENT);
+    fflush(stdout);
 }
 
 void showMenu(void)
 {
-    printf(" Supported commands:%s%s", EOL, EOL);
-    printf(BOLD);
-    printf("  [ Informational ]%s%s", EOL, EOL);
-    printf(OFF);
-    printf("     \"h\" = Show this menu%s", EOL);
-    printf("     \"v\" = Show current version%s%s", EOL, EOL);
-    printf(BOLD);
-    printf("  [ Debug interface enumeration (JTAGulator function) ]%s%s", EOL, EOL);
-    printf(OFF);
-    printf("     \"p\" = Toggle 'pin pulsing' setting (Default:OFF)%s", EOL);
-    printf("     \"j\" = Perform JTAG pinout scan%s", EOL);
-    printf("     \"s\" = Perform SWD pinout scan%s%s", EOL, EOL);
-    printf(BOLD);
-    printf("  [ Target reconnaissance ]%s%s", EOL, EOL);
-    printf(OFF);
-    printf("     \"m\" = Monitor pin states and activity%s", EOL);
-    printf("     \"u\" = Find UART TX pins and baud rates%s", EOL);
-    printf("     \"i\" = Scan an I2C bus for devices%s", EOL);
-    printf("     \"f\" = Identify an SPI flash chip%s%s", EOL, EOL);
-    printf(BOLD);
-    printf("  [ Hardware modes ]%s%s", EOL, EOL);
-    printf(OFF);
-    printf("     \"U\" = Activate USB-to-Serial mode%s", EOL);
-    printf("     \"F\" = Activate Flashrom's serial programmer mode%s", EOL); 
-    printf("     \"O\" = Activate Openocd JTAG/SWD debugger mode%s", EOL); 
-    printf("     \"C\" = Activate CMSIS-DAP v1.0 debugger mode%s%s", EOL, EOL); 
+    char pulse[40];
+    snprintf(pulse, sizeof(pulse), "Toggle pin pulsing [%s]", jPulsePins ? "ON" : "OFF");
 
-    printf(BOLD);
-    printf("  [ Hardware boot modes ]%s%s", EOL, EOL);
-    printf(OFF);
-    printf("     [     Only ONE boot mode can be active at a time     ]%s", EOL); 
-    printf("     +----------------------------------------------------+%s", EOL);
-    printf("     | RP2040 pin config   | Mode                         |%s", EOL);
-    printf("     +----------------------------------------------------+%s", EOL);             
-    printf("     | GPIO 26 -> GND      | USB-to-Serial                |%s", EOL);
-    printf("     | GPIO 27 -> GND      | Openocd JTAG/SWD debugger    |%s", EOL);
-    printf("     | GPIO 28 -> GND      | CMSIS-DAP v1.0 debugger      |%s", EOL);
-    printf("     +----------------------------------------------------+%s%s", EOL, EOL);
+    uiSection("COMMANDS", NULL);
+    uiGroup("General");
+    uiCommands('h', "Show this menu", 'v', "Show system info");
+    printf("%s", EOL);
+    uiGroup("Debug interface discovery");
+    uiCommands('j', "Scan for JTAG pinout", 's', "Scan for SWD pinout");
+    uiCommands('p', pulse, 0, NULL);
+    printf("%s", EOL);
+    uiGroup("Target reconnaissance");
+    uiCommands('m', "Monitor pin activity", 'u', "Find UART TX, RX and baud");
+    uiCommands('i', "Scan I2C bus", 'f', "Identify SPI flash chip");
+    printf("%s", EOL);
+    uiGroup("Hardware modes (unplug or reset to exit)");
+    uiCommands('U', "USB-to-serial bridge", 'F', "Flashrom SPI programmer");
+    uiCommands('O', "OpenOCD JTAG/SWD adapter", 'C', "CMSIS-DAP v1.0 debugger");
 
-    printf(BOLD);
-    printf(" Note 1:");
-    printf(OFF);
-    printf(" Disable 'local echo' in your terminal emulator program %s", EOL);
-    printf(BOLD);
-    printf(" Note 2:");
-    printf(OFF);
-    printf(" Try deactivating 'pin pulsing' (p) if valid JTAG/SWD pinout isn't found %s", EOL);
-    printf(BOLD);
-    printf(" Note 3:");
-    printf(OFF);
-    printf(" Unplug PROBINIX and reconnect (or reset) to disable 'Hardware modes' %s%s", EOL, EOL);    
-    printf(BOLD);
-    printf(" --  MAKE SURE GPIO-0 TO GPIO-15 ARE NOT CONNECTED TO 'GND'  -- %s", EOL); 
-    printf(" -- CONNECT ONLY TO TARGETS COMPATIBLE WITH 3.3V LOGIC LEVEL -- %s%s", EOL, EOL);   
-    printf(OFF);
- 
+    uiPinout();
+
+    uiSection("BOOT MODES", "Connect one pin to GND, then reset");
+    printf("%s  " CLR_KEY "GPIO 26" OFF "  USB-to-serial     "
+           CLR_KEY "GPIO 27" OFF "  OpenOCD     "
+           CLR_KEY "GPIO 28" OFF "  CMSIS-DAP%s", UI_INDENT, EOL);
+
+    uiSection("NOTES", NULL);
+    printf("%s  - Disable local echo in your terminal.%s", UI_INDENT, EOL);
+    printf("%s  - If no JTAG or SWD pinout is found, toggle pin pulsing (p) and retry.%s", UI_INDENT, EOL);
+    printf("%s  " CLR_WARN "! 3.3 V logic only. Keep GPIO 0-15 disconnected from GND while scanning." OFF "%s%s",
+           UI_INDENT, EOL, EOL);
 }
 
 void printProgress(size_t count, size_t max) {
     const int bar_width = 50;
 
-    float progress = (float) count / max;
+    float progress = (max > 0) ? (float) count / max : 1.0f;
+    if (progress > 1.0f)
+    {
+        progress = 1.0f;
+    }
     int bar_length = progress * bar_width;
 
-    printf("\r     Progress: [");
+    printf("\r%s  " CLR_DIM "[" OFF CLR_HEAD, UI_INDENT);
     for (int i = 0; i < bar_length; ++i) {
-        printf("#");
+        putchar('#');
     }
+    printf(OFF CLR_DIM);
     for (int i = bar_length; i < bar_width; ++i) {
-        printf(" ");
+        putchar('.');
     }
-    printf("] %.2f%%", progress * 100);
+    printf("]" OFF " %5.1f%%", progress * 100);
 
     fflush(stdout);
 }
@@ -252,14 +411,14 @@ int getIntFromSerial(void)
 int getChannels(void)
 {
     int x;
-    printf("     Enter number of channels hooked up (Min 4, Max %d): ", maxChannels);
+    printf("%s" CLR_KEY "?" OFF " Channels connected, starting at GP0 (4-%d): ", UI_INDENT, maxChannels);
     x = getIntFromSerial();
     while(x < 4 || x > maxChannels)
     {
-        printf("     Enter a valid value: ");
-        x = getIntFromSerial();       
+        printf("%s  Enter a value from 4 to %d: ", UI_INDENT, maxChannels);
+        x = getIntFromSerial();
     }
-    printf("     Number of channels set to: %d%s%s", x, EOL, EOL);
+    printf("%s" CLR_HEAD "[*]" OFF " Scanning with %d channels...%s%s", UI_INDENT, x, EOL, EOL);
     return(x);
 }
 
@@ -443,17 +602,16 @@ void displayPinout(void)
 {
     printProgress(maxPermutations, maxPermutations);
     printf("%s%s", EOL, EOL);
-    printf("     [  Pinout  ]  TDI=CH%d", xTDI);
-    printf(" TDO=CH%d", xTDO);
-    printf(" TCK=CH%d", xTCK);
-    printf(" TMS=CH%d", xTMS);
+    uiOk("JTAG pinout found");
+    printf("%s  TDI = " CLR_KEY "GP%u" OFF "   TDO = " CLR_KEY "GP%u" OFF "   TCK = " CLR_KEY "GP%u" OFF
+           "   TMS = " CLR_KEY "GP%u" OFF "   TRST = ", UI_INDENT, xTDI, xTDO, xTCK, xTMS);
     if(xTRST != 0)
     {
-        printf(" TRST=CH%d %s%s", xTRST, EOL, EOL );
+        printf(CLR_KEY "GP%u" OFF "%s%s", xTRST, EOL, EOL);
     }
     else
     {
-        printf(" TRST=N/A %s%s", EOL, EOL);
+        printf(CLR_DIM "not found" OFF "%s%s", EOL, EOL);
     }
 }
 
@@ -485,35 +643,36 @@ bool isValidDeviceID(uint32_t idc)
     return(false);
 }
 
+static void uiPrintDevice(int index, uint32_t idc)
+{
+    unsigned long part = (idc & 0xffff000) >> 12;
+    int bank = (idc & 0xf00) >> 8;
+    int id = (idc & 0xfe) >> 1;
+    int ver = (idc & 0xf0000000) >> 28;
+
+    printf("%s  Device %d   IDCODE " CLR_KEY "0x%08lX" OFF, UI_INDENT, index, (unsigned long)idc);
+    if (id > 1 && id <= 126 && bank <= 8)
+    {
+        printf("   %s, part 0x%04lX, rev %d", jep106_table_manufacturer(bank, id), part, ver);
+    }
+    printf("%s", EOL);
+}
+
 void displayDeviceDetails(void)
 {
     for(int x=0; x < jDeviceCount; x++)
     {
-        printf("     [ Device %d ]  0x%08X ", x, deviceIDs[x]);
-        uint32_t idc = deviceIDs[x];
-        long part = (idc & 0xffff000) >> 12;
-        int bank=(idc & 0xf00) >> 8;
-        int id=(idc & 0xfe) >> 1;
-        int ver=(idc & 0xf0000000) >> 28;
-
-        if (id > 1 && id <= 126 && bank <= 8) 
-        {
-            printf("(mfg: '%s' , part: 0x%x, ver: 0x%x)%s", jep106_table_manufacturer(bank,id), part, ver, EOL);
-        }
+        uiPrintDevice(x, deviceIDs[x]);
     }
-    printf("%s%s", EOL, EOL);
-    printf(" Enable hardware OpenOCD mode for JTAG debugging? (y/n): ");
-    cmd = getc(stdin);
-    if ( cmd == 'y')
+    printf("%s", EOL);
+    if (uiAskYes("Start OpenOCD JTAG mode with this pinout?"))
     {
-        printf("y%s%s", EOL, EOL);
-        printf(" [ Ex. Openocd command ]%s%s", EOL, EOL);
-        printf("   'openocd -f interface/buspirate.cfg -c \"buspirate port XXXXXXXXXX; transport select jtag;\" -f target/esp32.cfg'%s", EOL);
-        printf("    Replace 'XXXXXXXXXX' with COM port of PROBINIX [Ex. '/dev/ttyACM0' (Linux) or 'COM4' (Win)]%s%s", EOL, EOL);                
-        resetUART();  
+        uiNote("Example command. Replace COM4 with your PROBINIX port.");
+        uiCommand("JTAG", "openocd -f interface/buspirate.cfg -c \"buspirate port COM4; transport select jtag;\" -f target/esp32.cfg");
+        printf("%s", EOL);
+        resetUART();
         initOpenocdMode(jTCK, jTMS, jTDI, jTDO, OPENOCD_PIN_DEFAULT, OPENOCD_PIN_DEFAULT, OPENOCD_MODE_JTAG);
     }
-    printf("%s%s", EOL, EOL);
 }
 
 // Function to detect number of devices in the scan chain 
@@ -787,7 +946,8 @@ void jtagScan(void)
     {
         printProgress(maxPermutations, maxPermutations);
         printf("%s%s", EOL, EOL);
-        printf("     No JTAG devices found. Please try again.%s%s", EOL, EOL);
+        uiFail("No JTAG device found. Check wiring and GND, or toggle pin pulsing (p).");
+        printf("%s", EOL);
     }
 
 }
@@ -811,53 +971,38 @@ uint xSwdIO=1;
 bool swdDeviceFound=false;
 int getSwdChannels(void)
 {
-    char x;
-    printf("     Enter number of channels hooked up (Min 2, Max %d): ", maxChannels);
+    int x;
+    printf("%s" CLR_KEY "?" OFF " Channels connected, starting at GP0 (2-%d): ", UI_INDENT, maxChannels);
     x = getIntFromSerial();
     while(x < 2 || x > maxChannels)
     {
-        printf("     Enter a valid value: ");
+        printf("%s  Enter a value from 2 to %d: ", UI_INDENT, maxChannels);
         x = getIntFromSerial();
     }
-    printf("     Number of channels set to: %d%s%s", x, EOL, EOL);
+    printf("%s" CLR_HEAD "[*]" OFF " Scanning with %d channels...%s%s", UI_INDENT, x, EOL, EOL);
     return(x);
 }
 
 void swdDisplayDeviceDetails(uint32_t idcode)
 {
-    printf("     [ Device 0 ]  0x%08X ",  idcode);
-    uint32_t idc = idcode;
-    long part = (idc & 0xffff000) >> 12;
-    int bank=(idc & 0xf00) >> 8;
-    int id=(idc & 0xfe) >> 1;
-    int ver=(idc & 0xf0000000) >> 28;
-
-    if (id > 1 && id <= 126 && bank <= 8) 
+    uiPrintDevice(0, idcode);
+    printf("%s", EOL);
+    if (uiAskYes("Start OpenOCD SWD mode with this pinout?"))
     {
-        printf("(mfg: '%s' , part: 0x%x, ver: 0x%x)%s", jep106_table_manufacturer(bank,id), part, ver, EOL);
-    }
-
-    printf("%s%s", EOL, EOL);
-    printf(" Enable hardware OpenOCD mode for SWD debugging? (y/n): ");
-    cmd = getc(stdin);
-    if ( cmd == 'y')
-    {
-        printf("y%s%s", EOL, EOL);
-        printf(" [ Ex. Openocd command ]%s%s", EOL, EOL);
-        printf("   'openocd -f interface/buspirate.cfg -c \"buspirate port XXXXXXXXXX; transport select swd;\" -f target/stm32f1x.cfg'%s%s", EOL, EOL);
-        printf("    Replace 'XXXXXXXXXX' with COM port of PROBINIX [Ex. '/dev/ttyACM0' (Linux) or 'COM4' (Win)]%s%s", EOL, EOL);    
-        resetUART(); 
+        uiNote("Example command. Replace COM4 with your PROBINIX port.");
+        uiCommand("SWD", "openocd -f interface/buspirate.cfg -c \"buspirate port COM4; transport select swd;\" -f target/stm32f1x.cfg");
+        printf("%s", EOL);
+        resetUART();
         initOpenocdMode(OPENOCD_PIN_DEFAULT, OPENOCD_PIN_DEFAULT, OPENOCD_PIN_DEFAULT, OPENOCD_PIN_DEFAULT, xSwdClk, xSwdIO, OPENOCD_MODE_SWD);
     }
-    printf("%s%s", EOL, EOL);
 }
 
 void swdDisplayPinout(int swdio, int swclk, uint32_t idcode)
 {
     printProgress(maxPermutations, maxPermutations);
     printf("%s%s", EOL, EOL);
-    printf("     [  Pinout  ]  SWDIO=CH%d", swdio);
-    printf(" SWCLK=CH%d%s%s", swclk, EOL, EOL);
+    uiOk("SWD pinout found");
+    printf("%s  SWDIO = " CLR_KEY "GP%d" OFF "   SWCLK = " CLR_KEY "GP%d" OFF "%s%s", UI_INDENT, swdio, swclk, EOL, EOL);
     swdDisplayDeviceDetails(idcode);
 }
 
@@ -1108,7 +1253,8 @@ void swdScan(void)
     {
         printProgress(maxPermutations, maxPermutations);
         printf("%s%s", EOL, EOL);
-        printf("     No devices found. Please try again.%s%s", EOL, EOL);
+        uiFail("No SWD device found. Check wiring and GND, or toggle pin pulsing (p).");
+        printf("%s", EOL);
     }
     // Switch back to JTAG
     swdToJTAG();
@@ -1123,10 +1269,10 @@ static void busyLoop(size_t count)
 
 void resetUART(void)
 {
-    printf(" Press any key to activate... %s%s", EOL, EOL);
+    printf("%s" CLR_KEY "?" OFF " Press any key to start this mode...%s", UI_INDENT, EOL);
     char cmd = getc(stdin);
     printf(BOLD);
-    printf(" -- Activated --%s%s", EOL, EOL);
+    printf("%s" CLR_OK "[+]" OFF " Mode started. The USB device will now reconnect.%s%s", UI_INDENT, EOL, EOL);
     sleep_ms(4);
     printf(OFF);
     fflush(stdout);
@@ -1237,10 +1383,11 @@ int main()
         {
             // Help menu requested
             case 'h':
+                splashScreen();
                 showMenu();
                 break;
             case 'v':
-                printf(" Current version: %s%s%s", version, EOL, EOL);
+                uiSystemInfo();
                 break;
 
             case 'j':
@@ -1255,11 +1402,13 @@ int main()
                 jPulsePins=!jPulsePins;
                 if(jPulsePins)
                 {
-                    printf("     Pin pulsing activated.%s%s", EOL, EOL);
+                    uiOk("Pin pulsing ON");
+                    printf("%s", EOL);
                 }
                 else
                 {
-                    printf("     Pin pulsing deactivated.%s%s", EOL, EOL);
+                    uiOk("Pin pulsing OFF");
+                    printf("%s", EOL);
                 }                
                 break;
 
@@ -1291,29 +1440,15 @@ int main()
                 break;
 
             case 'U':
-                printf(BOLD);
-                printf(" USB-to-Serial mode%s%s", EOL, EOL);
-                printf(OFF);
-                printf(" [ Pin configuration to target UART interface ]%s%s", EOL, EOL);               
-                printf("          +-------------------------+%s", EOL);
-                printf("          | RP2040 pin  | Target    |%s", EOL);
-                printf("          +-------------------------+%s", EOL);
-                printf("          | GPIO 0 (TX) | RX        |%s", EOL);
-                printf("          | GPIO 1 (RX) | TX        |%s", EOL);
-                printf("          | GND         | GND       |%s", EOL);
-                printf("          |-------------------------|%s", EOL);
-                printf("          | Optional:               |%s", EOL);
-                printf("          |-------------------------|%s", EOL);
-                printf("          | 3V3 Out     | VCC       |%s", EOL);
-                printf("          +-------------------------+%s%s", EOL, EOL);
-                printf(" [ Information ]%s%s", EOL, EOL);
-                printf("   In this mode, PROBINIX functions like a standard USB-to-Serial programmer,%s", EOL);
-                printf("   simply (re)open the COM port and configure the UART settings as required.%s%s", EOL, EOL);
-                printf(BOLD);
-                printf(" Note:");
-                printf(OFF);
-                printf(" Connect PROBINIX's '3V3 Out' pin to the target UART's 'VCC' pin only if the target%s", EOL); 
-                printf("       isn't externally powered%s%s", EOL, EOL); 
+                uiSection("USB-TO-SERIAL MODE", NULL);
+                uiWireHeader();
+                uiWire("GP0 (TX)", "RX");
+                uiWire("GP1 (RX)", "TX");
+                uiWire("GND", "GND");
+                uiWire("3V3 OUT", "VCC, only if the target has no power");
+                printf("%s", EOL);
+                uiNote("Reopen the COM port and set the target's UART settings.");
+                printf("%s", EOL);
 
                 usbMode = USB_MODE_UART;
                 resetUART();
@@ -1327,62 +1462,44 @@ int main()
                 break;
 
             case 'F':
-                printf(BOLD);           
-                printf(" Flashrom's Serial Programmer mode %s%s", EOL, EOL);
-                printf(OFF);
-                printf(" [ Pin configuration to target SPI Flash IC ]%s%s", EOL, EOL);                
-                printf("         +-------------------------+%s", EOL);
-                printf("         | RP2040 pin  | SPI Flash |%s", EOL);
-                printf("         +-------------------------+%s", EOL);
-                printf("         | GPIO 1      | CS        |%s", EOL);
-                printf("         | GPIO 2      | CLK       |%s", EOL);
-                printf("         | GPIO 3      | MOSI / DI |%s", EOL);
-                printf("         | GPIO 4      | MISO / DO |%s", EOL);
-                printf("         | GND         | GND       |%s", EOL);
-                printf("         |-------------------------|%s", EOL);
-                printf("         | Optional:               |%s", EOL);
-                printf("         |-------------------------|%s", EOL);
-                printf("         | 3V3 Out     | VCC       |%s", EOL);
-                printf("         +-------------------------+%s%s", EOL, EOL);
-                printf(" [ Ex. Flashrom commands ]%s%s", EOL, EOL);
-                printf("   Read  : 'flashrom -p serprog:dev=XXXXXXXXXX:115200,spispeed=12M -r flashBackup.bin'%s", EOL);
-                printf("   Write : 'flashrom -p serprog:dev=XXXXXXXXXX:115200,spispeed=12M -w flash.bin'%s%s", EOL, EOL);
-                printf("   Replace 'XXXXXXXXXX' with COM port of PROBINIX [Ex. '/dev/ttyACM0' (Linux) or 'COM4' (Win)]%s%s", EOL, EOL);
-                printf(BOLD);
-                printf(" Note:");
-                printf(OFF);
-                printf(" Connect PROBINIX's '3V3 Out' pin to target SPI Flash IC's 'VCC' pin only if the target%s", EOL); 
-                printf("       isn't externally powered%s%s", EOL, EOL); 
+                uiSection("FLASHROM SPI PROGRAMMER", NULL);
+                uiWireHeader();
+                uiWire("GP1", "CS");
+                uiWire("GP2", "CLK");
+                uiWire("GP3", "MOSI / DI");
+                uiWire("GP4", "MISO / DO");
+                uiWire("GND", "GND");
+                uiWire("3V3 OUT", "VCC, only if the target has no power");
+                printf("%s", EOL);
+                uiNote("Windows  (replace COM4 with your PROBINIX port)");
+                uiCommand("Detect", "flashrom -p serprog:dev=COM4:115200,spispeed=4M");
+                uiCommand("Read", "flashrom -p serprog:dev=COM4:115200,spispeed=4M -r backup.bin");
+                uiCommand("Write", "flashrom -p serprog:dev=COM4:115200,spispeed=4M -w firmware.bin");
+                printf("%s", EOL);
+                uiNote("Linux  (find the port with: ls /dev/ttyACM*)");
+                uiCommand("Detect", "flashrom -p serprog:dev=/dev/ttyACM0:115200,spispeed=4M");
+                uiCommand("Read", "flashrom -p serprog:dev=/dev/ttyACM0:115200,spispeed=4M -r backup.bin");
+                uiCommand("Write", "flashrom -p serprog:dev=/dev/ttyACM0:115200,spispeed=4M -w firmware.bin");
+                printf("%s", EOL);
+                uiNote("Close this terminal before running flashrom. Use spispeed=1M if reads fail.");
+                printf("%s", EOL);
                 resetUART();
                 initSerProg();
                 break;
 
             case 'O':
-                printf(BOLD);
-                printf(" Openocd JTAG/SWD debugger mode %s%s", EOL, EOL);
-                printf(OFF);
-                printf(" [ Pin configuration to Target ]%s%s", EOL, EOL);
-                printf("   +-------------------------+%s", EOL);
-                printf("   | RP2040 pin  | Target    |%s", EOL);
-                printf("   +-------------------------+%s", EOL);
-                printf("   | JTAG mode:              |%s", EOL);
-                printf("   |-------------------------|%s", EOL);                
-                printf("   | GPIO 0      | TCK       |%s", EOL);
-                printf("   | GPIO 1      | TMS       |%s", EOL);
-                printf("   | GPIO 2      | TDI       |%s", EOL);
-                printf("   | GPIO 3      | TDO       |%s", EOL);
-                printf("   | GND         | GND       |%s", EOL);                
-                printf("   |-------------------------|%s", EOL);
-                printf("   | SWD mode:               |%s", EOL);
-                printf("   |-------------------------|%s", EOL);    
-                printf("   | GPIO 2      | SWDCLK    |%s", EOL);
-                printf("   | GPIO 3      | SWDIO     |%s", EOL);                                            
-                printf("   | GND         | GND       |%s", EOL);
-                printf("   +-------------------------+%s%s", EOL, EOL);
-                printf(" [ Ex. Openocd commands ]%s%s", EOL, EOL);
-                printf("   JTAG : 'openocd -f interface/buspirate.cfg -c \"buspirate port XXXXXXXXXX; transport select jtag;\" -f target/esp32.cfg'%s", EOL);
-                printf("   SWD  : 'openocd -f interface/buspirate.cfg -c \"buspirate port XXXXXXXXXX; transport select swd;\" -f target/stm32f1x.cfg'%s%s", EOL, EOL);
-                printf("   Replace 'XXXXXXXXXX' with COM port of PROBINIX [Ex. '/dev/ttyACM0' (Linux) or 'COM4' (Win)]%s%s", EOL, EOL);
+                uiSection("OPENOCD DEBUGGER MODE", "Bus Pirate protocol");
+                uiWireHeader();
+                uiWire("GP0", "TCK (JTAG)");
+                uiWire("GP1", "TMS (JTAG)");
+                uiWire("GP2", "TDI (JTAG)  or  SWCLK (SWD)");
+                uiWire("GP3", "TDO (JTAG)  or  SWDIO (SWD)");
+                uiWire("GND", "GND");
+                printf("%s", EOL);
+                uiNote("Example commands. Replace COM4 with your PROBINIX port.");
+                uiCommand("JTAG", "openocd -f interface/buspirate.cfg -c \"buspirate port COM4; transport select jtag;\" -f target/esp32.cfg");
+                uiCommand("SWD", "openocd -f interface/buspirate.cfg -c \"buspirate port COM4; transport select swd;\" -f target/stm32f1x.cfg");
+                printf("%s", EOL);
                 resetUART();                
      
                 jTCK = OPENOCD_PIN_DEFAULT;
@@ -1395,26 +1512,22 @@ int main()
                 break;
 
             case 'C':
-                printf(BOLD);
-                printf(" CMSIS-DAP v1.0 debugger mode %s%s", EOL, EOL);
-                printf(OFF);
-                printf(" [ Pin configuration to Target ]%s%s", EOL, EOL);                
-                printf("   +-------------------------+%s", EOL);
-                printf("   | RP2040 pin  | Target    |%s", EOL);
-                printf("   +-------------------------+%s", EOL);             
-                printf("   | GPIO 0 (TX) | UART RX   |%s", EOL);
-                printf("   | GPIO 1 (RX) | UART TX   |%s", EOL);
-                printf("   | GPIO 2      | SWCLK     |%s", EOL);
-                printf("   | GPIO 3      | SWDIO     |%s", EOL);
-                printf("   | GND         | GND       |%s", EOL);                
-                printf("   +-------------------------+%s%s", EOL, EOL);
-                printf(" [ Ex. Openocd command ]%s%s", EOL, EOL);
-                printf("   CMSIS-DAP : 'openocd -f interface/cmsis-dap.cfg -f target/stm32f1x.cfg'%s%s", EOL, EOL);
+                uiSection("CMSIS-DAP v1.0 DEBUGGER", NULL);
+                uiWireHeader();
+                uiWire("GP0 (TX)", "UART RX");
+                uiWire("GP1 (RX)", "UART TX");
+                uiWire("GP2", "SWCLK");
+                uiWire("GP3", "SWDIO");
+                uiWire("GND", "GND");
+                printf("%s", EOL);
+                uiNote("Example command:");
+                uiCommand("OpenOCD", "openocd -f interface/cmsis-dap.cfg -f target/stm32f1x.cfg");
+                printf("%s", EOL);
 
-                printf(" Press any key to activate... %s%s", EOL, EOL);
+                printf("%s" CLR_KEY "?" OFF " Press any key to start this mode...%s", UI_INDENT, EOL);
                 char cmd = getc(stdin);
                 printf(BOLD);
-                printf(" -- Activated --%s%s", EOL, EOL);
+                printf("%s" CLR_OK "[+]" OFF " Mode started. The USB device will now reconnect.%s%s", UI_INDENT, EOL, EOL);
                 sleep_ms(4);
                 printf(OFF);
                 fflush(stdout);
@@ -1430,7 +1543,7 @@ int main()
                 break;
 
             default:
-                printf(" Unknown command %s%s", EOL, EOL);
+                printf("%s" CLR_FAIL "[-]" OFF " Unknown command '%c'. Press 'h' for help.%s%s", UI_INDENT, cmd, EOL, EOL);
                 break;
         }
         showPrompt();

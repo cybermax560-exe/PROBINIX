@@ -11,11 +11,15 @@
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/systick.h"
+#include "hardware/sync.h"
 #include "recon.h"
 
 #define EOL             "\r\n"
 #define BOLD            "\033[1m"
 #define OFF             "\033[0m"
+#define CLR_HEAD        "\033[1;36m"
+#define CLR_DIM         "\033[90m"
+#define CLR_OK          "\033[1;32m"
 #define CHANNELS        16
 #define MAX_WIDTHS      128
 #define SYSTICK_MASK    0x00FFFFFFu
@@ -23,6 +27,9 @@
 #define MONITOR_MS      1000
 #define UART_SCAN_MS    5000
 #define UART_MIN_PULSES 16
+#define UART_RX_QUIET_MS 150
+#define UART_RX_REPLY_MS 400
+#define UART_RX_MIN_EDGES 4
 
 #define I2C_HALF_US     10      // About 50 kHz, safe with internal pull-ups
 #define I2C_STRETCH_US  2000
@@ -52,6 +59,16 @@ static channelCapture capture[CHANNELS];
 static const uint32_t standardBauds[] = {
     460800, 230400, 115200, 76800, 57600, 38400, 19200, 9600, 4800, 2400, 1200
 };
+
+static void reconTitle(const char *title)
+{
+    printf("  " CLR_HEAD "%s" OFF " " CLR_DIM, title);
+    for (int i = (int)strlen(title) + 1; i < 76; i++)
+    {
+        putchar('-');
+    }
+    printf(OFF "%s%s", EOL, EOL);
+}
 
 //------------------------------------------ Input -------------------------------------------------
 
@@ -251,7 +268,7 @@ void reconPinMonitor(void)
 {
     const char *states[CHANNELS];
 
-    printf(BOLD " Pin monitor" OFF "%s%s", EOL, EOL);
+    reconTitle("PIN MONITOR");
     int count = readChannelCount();
 
     listenOnChannels(count);
@@ -347,9 +364,97 @@ static uint32_t detectBaud(const channelCapture *c, uint32_t clockHz)
     return 0;
 }
 
+// Send text on any pin as 8N1 UART, timed by CPU cycles. Runs from RAM with interrupts off.
+static void __not_in_flash_func(uartBitBangSend)(uint pin, const char *text, uint32_t cyclesPerBit)
+{
+    uint32_t savedCsr = systick_hw->csr;
+    uint32_t savedRvr = systick_hw->rvr;
+
+    systick_hw->csr = 0;
+    systick_hw->rvr = SYSTICK_MASK;
+    systick_hw->cvr = 0;
+    systick_hw->csr = 5;
+
+    uint32_t interrupts = save_and_disable_interrupts();
+    uint32_t lastTick = systick_hw->cvr;
+    uint32_t elapsed = 0;
+    uint32_t nextEdge = 0;
+
+    for (const char *p = text; *p; p++)
+    {
+        // Bit 0 = start (low), bits 1-8 = data LSB first, bit 9 = stop (high)
+        uint32_t frame = ((uint32_t)(uint8_t)*p << 1) | (1u << 9);
+        for (int bit = 0; bit < 10; bit++)
+        {
+            gpio_put(pin, (frame >> bit) & 1);
+            nextEdge += cyclesPerBit;
+            while (elapsed < nextEdge)
+            {
+                uint32_t tick = systick_hw->cvr;
+                elapsed += (lastTick - tick) & SYSTICK_MASK;
+                lastTick = tick;
+            }
+        }
+    }
+
+    restore_interrupts(interrupts);
+    systick_hw->csr = 0;
+    systick_hw->rvr = savedRvr;
+    systick_hw->cvr = 0;
+    systick_hw->csr = savedCsr;
+}
+
+static uint32_t countEdgesOn(uint pin, uint32_t milliseconds)
+{
+    captureEdges(1u << pin, (clock_get_hz(clk_sys) / 1000) * milliseconds);
+    return capture[pin].edges;
+}
+
+// Drive each candidate pin, send Enter, and watch the target's TX pin for a reply.
+static int findUartRx(int count, uint txPin, uint32_t baud, uint32_t skipMask)
+{
+    uint32_t clockHz = clock_get_hz(clk_sys);
+    uint32_t cyclesPerBit = clockHz / baud;
+    int found = 0;
+
+    for (int pin = 0; pin < count; pin++)
+    {
+        if (pin == (int)txPin || (skipMask & (1u << pin)))
+        {
+            continue;
+        }
+
+        printf("\r     Testing GP%-2d ...", pin);
+        fflush(stdout);
+
+        gpio_init(txPin);
+        gpio_set_pulls(txPin, false, true);
+        gpio_init(pin);
+        gpio_put(pin, 1);                       // UART idle level
+        gpio_set_dir(pin, GPIO_OUT);
+
+        uint32_t quietEdges = countEdgesOn(txPin, UART_RX_QUIET_MS);
+        uartBitBangSend(pin, "\r\n", cyclesPerBit);
+        uint32_t replyEdges = countEdgesOn(txPin, UART_RX_REPLY_MS);
+        uartBitBangSend(pin, "\r\n", cyclesPerBit);
+        replyEdges += countEdgesOn(txPin, UART_RX_REPLY_MS);
+
+        releasePin(pin);
+
+        if (replyEdges >= UART_RX_MIN_EDGES && replyEdges > quietEdges * 6 + UART_RX_MIN_EDGES)
+        {
+            printf("\r     " CLR_OK "[+]" OFF " GP%d looks like target RX (the target replied)%s", pin, EOL);
+            found++;
+        }
+    }
+    releasePin(txPin);
+    printf("\r                          \r");
+    return found;
+}
+
 void reconUartScan(void)
 {
-    printf(BOLD " UART TX and baud rate scan" OFF "%s%s", EOL, EOL);
+    reconTitle("UART FINDER");
     int count = readChannelCount();
 
     printf("%s     Press any key, then power-cycle or reset the target so it prints boot output.%s", EOL, EOL);
@@ -357,7 +462,7 @@ void reconUartScan(void)
     getc(stdin);
 
     listenOnChannels(count);
-    printf("%s     Listening for %d seconds...%s%s", EOL, UART_SCAN_MS / 1000, EOL, EOL);
+    printf("%s     Step 1: listening for TX for %d seconds...%s%s", EOL, UART_SCAN_MS / 1000, EOL, EOL);
     fflush(stdout);
 
     uint32_t clockHz = clock_get_hz(clk_sys);
@@ -365,6 +470,10 @@ void reconUartScan(void)
     releaseChannels(count);
 
     int found = 0, active = 0;
+    int txPin = -1;
+    uint32_t txBaud = 0;
+    uint32_t activeMask = 0;
+
     for (int pin = 0; pin < count; pin++)
     {
         if (capture[pin].edges == 0)
@@ -372,11 +481,17 @@ void reconUartScan(void)
             continue;
         }
         active++;
+        activeMask |= 1u << pin;
         uint32_t baud = detectBaud(&capture[pin], clockHz);
         if (baud)
         {
-            printf("     [ Found ] GPIO %d looks like target TX at %lu baud%s",
+            printf("     " CLR_OK "[+]" OFF " GP%d looks like target TX at %lu baud%s",
                    pin, (unsigned long)baud, EOL);
+            if (txPin < 0)
+            {
+                txPin = pin;
+                txBaud = baud;
+            }
             found++;
         }
     }
@@ -384,13 +499,40 @@ void reconUartScan(void)
     if (found == 0)
     {
         printf("     No UART transmit signal recognized (%d active channel(s)).%s", active, EOL);
-        printf("     Try again while the target is booting or producing output.%s", EOL);
+        printf("     Try again while the target is booting or producing output.%s%s", EOL, EOL);
+        return;
     }
-    else
+
+    if (count < 2)
     {
-        printf("%s     Wire the target's TX to GPIO 1, then use USB-to-Serial mode (U).%s", EOL, EOL);
+        printf("%s     Connect more channels to search for the target's RX pin.%s%s", EOL, EOL, EOL);
+        return;
     }
-    printf("%s", EOL);
+
+    printf("%s     Step 2 sends Enter on each quiet channel and watches GP%d for a reply.%s", EOL, txPin, EOL);
+    printf("     " CLR_DIM "It drives those channels, so connect them only to the target's UART pins." OFF "%s", EOL);
+    printf("     " CLR_DIM "Wait until the target has finished booting before you continue." OFF "%s%s", EOL, EOL);
+    printf("     \033[1;33m?\033[0m Search for the target's RX pin? (y/n): ");
+    fflush(stdout);
+    int answer = getc(stdin);
+    printf("%c%s%s", (answer >= 32 && answer < 127) ? answer : ' ', EOL, EOL);
+
+    int rxFound = 0;
+    if (answer == 'y' || answer == 'Y')
+    {
+        rxFound = findUartRx(count, (uint)txPin, txBaud, activeMask);
+        if (rxFound == 0)
+        {
+            printf("     No RX pin found. The target may ignore input, or its console may be disabled.%s", EOL);
+        }
+        else if (rxFound > 1)
+        {
+            printf("     " CLR_DIM "More than one pin replied. Test each one in USB-to-serial mode." OFF "%s", EOL);
+        }
+    }
+
+    printf("%s     Wire target TX to GP1%s, then use USB-to-serial mode (U) at %lu baud.%s%s",
+           EOL, rxFound ? " and target RX to GP0" : "", (unsigned long)txBaud, EOL, EOL);
 }
 
 //------------------------------------------ I2C scan ----------------------------------------------
@@ -539,7 +681,7 @@ static bool i2cProbe(uint8_t address, bool *busError)
 
 void reconI2cScan(void)
 {
-    printf(BOLD " I2C bus scan" OFF "%s%s", EOL, EOL);
+    reconTitle("I2C SCANNER");
     printf("     SDA GPIO (0-%d) [0]: ", CHANNELS - 1);
     fflush(stdout);
     i2cSda = readNumber(0, CHANNELS - 1, 0);
@@ -631,7 +773,7 @@ void reconSpiFlashId(void)
 {
     uint8_t id[SPI_ID_LEN];
 
-    printf(BOLD " SPI flash identification" OFF "%s%s", EOL, EOL);
+    reconTitle("SPI FLASH IDENTIFICATION");
     printf("     Wiring: GPIO %d=CS, GPIO %d=CLK, GPIO %d=MOSI/DI, GPIO %d=MISO/DO, GND=GND%s",
            SPI_CS, SPI_CLK, SPI_MOSI, SPI_MISO, EOL);
     printf("     Press any key to read the chip ID...%s%s", EOL, EOL);

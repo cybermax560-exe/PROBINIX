@@ -105,6 +105,7 @@ target_link_libraries(${PROJECT_NAME}
     hardware_spi
 	pico_multicore
     pico_rand
+    pico_unique_id
     pico_stdio_usb
 	tinyusb_device
     tinyusb_board

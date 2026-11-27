@@ -170,7 +170,7 @@ enum
 };
 
 static const char *const usbd_desc_str_default[] = {
-	[USBD_STR_MANUF]   = "CybermaX",
+	[USBD_STR_MANUF]   = "BugFox",
 	[USBD_STR_PRODUCT] = "PROBINIX",
 	[USBD_STR_SERIAL]  = usbdSerial,
 	[USBD_STR_CDC]     = "PROBINIX CDC",
@@ -179,7 +179,7 @@ static const char *const usbd_desc_str_default[] = {
 char const* string_desc_arr_cmsisdap[] =
 {
   [STRID_LANGID]       = (const char[]) { 0x09, 0x04 }, 
-  [STRID_MANUFACTURER] = "CybermaX",                     
+  [STRID_MANUFACTURER] = "BugFox",                     
   [STRID_PRODUCT]      = "PROBINIX CMSIS-DAP",    
 };
 
